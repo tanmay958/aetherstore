@@ -37,10 +37,9 @@ network. A cold segment answers a single-term query in three reads, a warm one
 in a single read, and the two cacheable reads never repeat because the file
 can never change.
 
-Postings are delta-encoded and varint-packed (see `codec.py`), and docstore
-blocks are deflated. The term dictionary is still stored plainly; front coding
-it is a later refinement, and leaving it alone keeps this step's size change
-attributable to the two things that actually changed.
+Postings are delta-encoded and bit-packed in skippable blocks of 128 (see
+`blocked.py`), the term dictionary is front-coded with varint metadata, and
+docstore blocks are deflated.
 
     python -m aether.index.build tests/fixtures/rees46_sample.csv out.seg
 """
@@ -55,6 +54,7 @@ from pathlib import Path
 from typing import Iterable, Iterator
 
 from aether.index.base import SearchableIndex
+from aether.index.blocked import BlockedPostings, encode_blocked
 from aether.index.bloom import BloomFilter
 from aether.index.codec import (
     decode_varint,
@@ -69,7 +69,7 @@ from aether.storage.base import ObjectStore
 from aether.storage.local import LocalStore
 
 SEGMENT_MAGIC = b"ATHR"
-SEGMENT_VERSION = 5
+SEGMENT_VERSION = 6
 
 # Terms per dictionary block. Finding a term costs one request for the block
 # containing it, so a larger block means fetching more bytes you will discard
@@ -157,27 +157,19 @@ class Footer:
 
 
 def _encode_postings(doc_ids: list[int], freqs: list[int]) -> bytes:
-    """One term's posting list: a count, then ids, then frequencies.
+    """One term's posting list, in skippable bit-packed blocks.
 
-    Ids and frequencies stay in separate runs rather than interleaved because
-    they compress differently. Ids are ascending, so their gaps are tiny and
-    delta encoding collapses them; frequencies are small independent integers
-    that delta encoding would only make worse. Keeping the runs apart lets
-    each use the representation that suits it, and lets either be replaced
-    later without disturbing the other.
+    Ids and frequencies stay in separate runs within each block rather than
+    interleaved, because they compress differently: ascending ids leave tiny
+    gaps, while frequencies are small independent integers that delta encoding
+    would only make worse. Each run gets the bit width its own block needs.
     """
-    return (
-        encode_varint(len(doc_ids))
-        + encode_varints(delta_encode(doc_ids))
-        + encode_varints(freqs)
-    )
+    return encode_blocked(doc_ids, freqs)
 
 
-def _decode_postings(data: bytes) -> PostingList:
-    count, pos = decode_varint(data)
-    gaps, pos = decode_varints(data, count, pos)
-    freqs, _ = decode_varints(data, count, pos)
-    return PostingList(doc_ids=delta_decode(gaps), freqs=freqs)
+def _decode_postings(data: bytes) -> BlockedPostings:
+    """Lazy: the skip index is read now, the packed blocks on demand."""
+    return BlockedPostings(data)
 
 
 def _encode_dict_block(entries: list[tuple[str, int, int, int]]) -> bytes:

@@ -3,7 +3,9 @@ name = "aetherstore"
 version = "0.1.0"
 description = "A distributed search and streaming prediction engine, built from scratch"
 requires-python = ">=3.12"
-dependencies = []
+dependencies = [
+    "numpy>=2.0",
+]
 
 [project.optional-dependencies]
 # Needed only to talk to S3-compatible storage. The engine itself has no

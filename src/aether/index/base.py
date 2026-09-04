@@ -20,6 +20,7 @@ from dataclasses import dataclass
 from typing import Iterable, Literal
 
 from aether.index.analyzer import tokenize
+from aether.index.blocked import BlockedPostings, intersect_skipping
 from aether.index.postings import PostingList, intersect, union
 from aether.index.scorer import DEFAULT_SCORER, BM25
 
@@ -171,16 +172,36 @@ class SearchableIndex(ABC):
 
     # -- matching ----------------------------------------------------------
 
+    # Below this ratio between the shorter and longer side, skipping decodes
+    # fewer values than a straight walk. Above it the walk touches nearly
+    # every block anyway and the skip index is pure overhead. Blocks hold 128
+    # values, so skipping wins once the shorter side has fewer entries than
+    # the longer side has blocks.
+    SKIP_RATIO = 128
+
     @staticmethod
     def _intersect_all(lists: list[tuple[str, PostingList]]) -> list[int]:
         """Shortest list first. An intersection can only shrink, so starting
         from the rarest term keeps every subsequent walk as short as possible:
         pairing a 3-document list with a 50,000-document one costs 50,003
-        steps, while two 50,000-document lists cost 100,000."""
+        steps, while two 50,000-document lists cost 100,000.
+
+        When the two sides are lopsided enough, the longer one is not walked
+        at all. Its skip index names the single block that could contain each
+        candidate, so a term in 100 documents paired with one in 89,000
+        touches a handful of blocks instead of decoding them all.
+        """
         ordered = sorted(lists, key=lambda pair: pair[1].df)
         result = ordered[0][1].doc_ids
         for _, posting_list in ordered[1:]:
-            result = intersect(result, posting_list.doc_ids)
+            if (
+                isinstance(posting_list, BlockedPostings)
+                and result
+                and posting_list.df >= len(result) * SearchableIndex.SKIP_RATIO
+            ):
+                result = intersect_skipping(result, posting_list)
+            else:
+                result = intersect(result, posting_list.doc_ids)
             if not result:
                 break
         return list(result)

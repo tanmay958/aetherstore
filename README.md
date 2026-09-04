@@ -25,6 +25,8 @@ on Cloudflare R2.
 | 1.1 | Kafka indexer: idempotent flush, crash recovery | done |
 | 1.2 | Benchmarked on 1M real REES46 events | done |
 | 1.3 | Bloom filter per segment | done |
+| 1.4 | Front-coded term dictionary | done |
+| 1.5 | Bit-packed postings and skip lists | done |
 
 Later phases add the bloom filter and skip lists, Kafka and the indexer service, the multi-segment query coordinator, compaction, the ML pipeline, and a dashboard.
 Infrastructure comes last on purpose: the segment format needs none of it, and everything downstream is a caller of it.
@@ -38,33 +40,38 @@ One million real REES46 events, on an M-series laptop. Regenerate with
 INDEXING
   documents        1,000,000
   segments         100 (10,000 docs each)
-  throughput       62,391 docs/sec   (single threaded, pure Python)
+  throughput       57,481 docs/sec   (single threaded, pure Python)
 
 SIZE
   source           127.4 MB
-  index             95.0 MB   0.75x of source
-    postings          13.7 MB   14.4%
-    docstore          67.5 MB   71.1%
-    termdict           9.5 MB   10.0%
-    hotcache           4.3 MB    4.5%
-  bytes/posting    2.29   (8.00 at fixed width)
+  index             83.4 MB   0.66x of source
+    postings           8.1 MB    9.6%
+    docstore          67.5 MB   80.9%
+    termdict           3.1 MB    3.7%
+    hotcache           4.8 MB    5.8%
+  bytes/posting    1.35   (8.00 at fixed width)
 
 QUERIES (warm)               hits  requests       read      ms
-  common, two terms        89,707       200   772.5 KB     256
-  common, one term        386,044       100   754.2 KB     280
-  rare brand                   43        28    154.0 B       6
+  common, two terms        89,707       200   356.5 KB     230
+  common, one term        386,044       100   254.4 KB     252
+  rare brand                   43        28    154.0 B       7
   absent term                   0         0      0.0 B       2
 
 TIME PRUNING "samsung smartphone"
-  last hour              10/100 searched     20 requests    24 ms
-  everything            100/100 searched    200 requests   247 ms
+  last hour              10/100 searched     20 requests    22 ms
+  everything            100/100 searched    200 requests   225 ms
 ```
+
+Phase 1 took postings from 2.29 to 1.35 bytes each and the whole index from
+0.75x of source to 0.66x. The docstore is now 81% of what remains, and is the
+obvious next target for size.
 
 Two of these are worth dwelling on.
 
-**2.29 bytes per posting.** The 27-document fixture predicted 2.22. The
-extrapolation held across four and a half orders of magnitude, which is the
-only reason the earlier numbers were worth quoting at all.
+**1.35 bytes per posting**, against 8 at fixed width. Delta encoding, then bit
+packing each block of 128 at the width its largest gap needs, then a varint
+fallback for the 98.7% of terms that appear in fewer documents than a block
+holds.
 
 **4.3 MB of hotcache avoids reading 95 MB.** That is the whole design in one
 line: a small immutable summary, fetched once and cached forever because a
@@ -312,6 +319,8 @@ src/aether/
     ├── memory.py      in-memory inverted index, the correctness oracle
     ├── codec.py       delta encoding and varints for posting lists
     ├── bloom.py       per-segment term filter, rides in the hotcache
+    ├── bitpack.py     numpy bit packing at the width a block needs
+    ├── blocked.py     skippable posting blocks
     ├── scorer.py      BM25 relevance scoring
     ├── manifest.py    which segments are live: the commit point
     ├── coordinator.py fan out across segments, prune, merge
