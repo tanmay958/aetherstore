@@ -12,3 +12,9 @@ __pycache__/
 
 # Personal working notes, kept local.
 learnt.txt
+
+# Secrets. Never committed: this repo is intended to be public, and R2 API
+# tokens grant read and write on the bucket.
+.env
+.env.*
+!.env.example

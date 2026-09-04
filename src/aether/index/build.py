@@ -15,6 +15,7 @@ from aether.data.rees46 import iter_events
 from aether.index.memory import build_index
 from aether.index.segment import FOOTER_SIZE, SegmentReader, write_segment
 from aether.storage import open_object
+from aether.env import load_dotenv
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -28,6 +29,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--limit", type=int, default=None, help="index at most N events")
     args = parser.parse_args(argv)
+    load_dotenv()
 
     if not args.input.exists():
         parser.error(f"{args.input} not found. See docs/DATA.md for how to get it.")

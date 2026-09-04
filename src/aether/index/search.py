@@ -28,6 +28,7 @@ from aether.index.base import SearchableIndex
 from aether.index.memory import build_index
 from aether.index.segment import SegmentReader
 from aether.storage import CountingStore, LocalStore, ReadStats, open_object
+from aether.env import load_dotenv
 
 
 def load(target: str) -> tuple[SearchableIndex, str, CountingStore | None, str]:
@@ -53,6 +54,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--top", type=int, default=10, help="results to display")
     args = parser.parse_args(argv)
+    load_dotenv()
 
     if "://" not in args.input and not Path(args.input).exists():
         parser.error(f"{args.input} not found. See docs/DATA.md for how to get it.")

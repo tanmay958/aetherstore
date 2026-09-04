@@ -24,6 +24,7 @@ from pathlib import Path
 
 from aether.storage import open_store
 from aether.storage.base import ObjectStore
+from aether.env import load_dotenv
 
 # Big enough that a suffix read is unambiguous, small enough to be free.
 PAYLOAD = bytes(range(256)) * 16  # 4 KiB
@@ -90,6 +91,7 @@ def main(argv: list[str] | None = None) -> int:
         "--keep", action="store_true", help="leave the probe object behind"
     )
     args = parser.parse_args(argv)
+    load_dotenv()
 
     try:
         store = open_store(args.uri)

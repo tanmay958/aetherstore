@@ -127,13 +127,38 @@ Co-locating compute with the bucket matters here: a range read within one region
 If credential resolution fails with `Missing Dependency ... botocore[crt]`, an SSO or login profile is being picked up.
 Either set `AWS_PROFILE` to a key-based profile or install the extra.
 
-## The cost model, restated
+## The cost model, measured
 
-| Operation | Latency | Cost |
+Commonly quoted figures for object storage put a range GET at 20 to 50 ms, and that is roughly right for compute sitting in the same region as the bucket.
+It is not what a laptop sees.
+These are real numbers from `aether.storage.check`, from a developer machine in India against R2:
+
+| Operation | Local seek | R2 from a laptop |
 |---|---|---|
-| RAM read | ~100 ns | free |
-| Local seek | ~100 us | free |
-| S3 or R2 range GET | 20-50 ms | billed per request, same for 64 B or 8 MB |
+| `put` 4 KiB | 0.37 ms | 1,192 ms |
+| `size` | 0.08 ms | 186 ms |
+| `get_range` 64 B | 0.08 ms | 243 ms |
+| `get_suffix` 116 B | 0.09 ms | 277 ms |
+| `get_range` 4 KiB | 0.06 ms | 190 ms |
+
+Around 200 ms per request, and identical whether it returns 64 bytes or 4 kilobytes.
+That is roughly 2,500 times a local seek, not the 300 times the in-region figure suggests.
+
+Run `check` against your own bucket before believing any of this: the number depends entirely on where you are relative to the endpoint, and it is the single most important constant in the whole design.
+
+A real search over this link:
+
+```
+  AND    4 docs in 369 ms
+  open (once)      2 requests, 290 B
+  term lookup      1 request, 194 B
+  posting lists    2 requests, 28 B
+  fetch  4 docs     1 request, 966 B
+```
+
+Six requests, 1.5 KB moved out of a 2.6 KB object.
+Reading the object whole would have been one request and might well have been faster at this size, which is the honest caveat: the format only pays off once segments are large enough that fetching them entirely is not an option.
+At 10,000 documents a segment is megabytes, and the six requests stay six.
 
 The number of requests is what you pay in both latency and money, and it does not change when you move from a laptop to the cloud.
 That is why `CountingStore` reports requests rather than only milliseconds, and why every command prints them:
