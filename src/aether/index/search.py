@@ -1,9 +1,15 @@
-"""Search either a REES46 CSV or a prebuilt segment file.
+"""Search a REES46 CSV or a prebuilt segment, and report what it cost.
 
-Given a .seg it opens the segment; given anything else it indexes the CSV in
-memory first. The query path afterwards is identical, because both satisfy
-SearchableIndex, which is the point: a caller never learns where the postings
-came from.
+Given a .seg it opens the segment through a counting store; given anything
+else it indexes the CSV in memory first. The query path afterwards is
+identical, because both satisfy SearchableIndex, which is the point: a caller
+never learns where the postings came from.
+
+For segments the cost is reported in requests, not only milliseconds. Locally
+every range read is a seek and therefore nearly free, so timings here flatter
+the engine enormously. The request count is the number that carries over to
+object storage unchanged, where each one is a 20-50ms round trip that costs
+money regardless of how many bytes it returns.
 
     python -m aether.index.search tests/fixtures/rees46_sample.csv "samsung smartphone"
     python -m aether.index.search out.seg "samsung smartphone"
@@ -20,19 +26,21 @@ from aether.index.analyzer import tokenize
 from aether.index.base import SearchableIndex
 from aether.index.memory import build_index
 from aether.index.segment import SegmentReader
+from aether.storage import CountingStore, LocalStore, ReadStats
 
 
-def load(path: Path) -> tuple[SearchableIndex, str]:
-    """Open a segment, or index a CSV in memory."""
+def load(path: Path) -> tuple[SearchableIndex, str, CountingStore | None]:
+    """Open a segment through a counting store, or index a CSV in memory."""
     if path.suffix == ".seg":
-        return SegmentReader.open(path), "segment"
-    return build_index(iter_events(path)), "memory index"
+        store = CountingStore(LocalStore(path.parent))
+        return SegmentReader(store, path.name), "segment", store
+    return build_index(iter_events(path)), "memory index", None
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="aether.index.search",
-        description="Build an in-memory inverted index and query it.",
+        description="Build or open an index and query it.",
     )
     parser.add_argument("input", type=Path, help="REES46 .csv/.csv.gz or a .seg")
     parser.add_argument("query", help="search terms")
@@ -46,12 +54,14 @@ def main(argv: list[str] | None = None) -> int:
         parser.error(f"{args.input} not found. See docs/DATA.md for how to get it.")
 
     started = time.perf_counter()
-    index, kind = load(args.input)
-    build_ms = (time.perf_counter() - started) * 1000
+    index, kind, store = load(args.input)
+    open_ms = (time.perf_counter() - started) * 1000
+    # A snapshot, not the live object: store.stats keeps accumulating.
+    open_cost = ReadStats(store.stats.requests, store.stats.bytes_read) if store else None
 
     print(
         f"{kind}: {index.num_docs:,} docs, {index.num_terms:,} terms, "
-        f"{index.num_postings:,} postings   opened in {build_ms:,.1f} ms"
+        f"{index.num_postings:,} postings   opened in {open_ms:,.1f} ms"
     )
     print(f"       {index.avg_doc_length:.1f} terms per document on average")
     print()
@@ -62,16 +72,21 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     print(f'query "{args.query}"  ->  {terms}')
-    for term in terms:
-        df = index.df(term)
-        # Rare terms are the informative ones, which is what BM25 will
-        # formalize in step 6.
+
+    # Costs are gathered per stage so the report separates what is paid once
+    # from what is paid on every query.
+    noop = CountingStore(LocalStore(".")) if store is None else store
+    with noop.measure() as lookup_cost:
+        term_dfs = [(term, index.df(term)) for term in terms]
+
+    for term, df in term_dfs:
         note = "  (not in index)" if df == 0 else ""
         print(f"    {term:<20} df {df:>6,}{note}")
 
-    started = time.perf_counter()
-    hits = index.search_or(args.query) if args.use_or else index.search_and(args.query)
-    query_ms = (time.perf_counter() - started) * 1000
+    with noop.measure() as match_cost:
+        started = time.perf_counter()
+        hits = index.search_or(args.query) if args.use_or else index.search_and(args.query)
+        query_ms = (time.perf_counter() - started) * 1000
 
     mode = "OR " if args.use_or else "AND"
     print(f"    {mode:<20} {len(hits):>6,} docs in {query_ms:.3f} ms")
@@ -81,9 +96,11 @@ def main(argv: list[str] | None = None) -> int:
         print("  no matches")
         return 0
 
+    with noop.measure() as fetch_cost:
+        shown = [(doc_id, index.document(doc_id)) for doc_id in hits[: args.top]]
+
     # Ordered by document id, not relevance: ranking arrives with BM25.
-    for doc_id in hits[: args.top]:
-        doc = index.document(doc_id)
+    for doc_id, doc in shown:
         title = doc["title"] or "(no title)"
         price = f"${doc['price']:,.2f}" if doc["price"] is not None else ""
         print(
@@ -92,6 +109,15 @@ def main(argv: list[str] | None = None) -> int:
         )
     if len(hits) > args.top:
         print(f"  ... and {len(hits) - args.top:,} more")
+
+    if store is not None:
+        print()
+        print("  storage cost")
+        print(f"    open (once)      {open_cost}")
+        print(f"    term lookup      {lookup_cost}")
+        print(f"    posting lists    {match_cost}")
+        print(f"    fetch {len(shown):>2} docs     {fetch_cost}")
+        print(f"    segment on disk  {store.size(args.input.name):,} B")
     return 0
 
 

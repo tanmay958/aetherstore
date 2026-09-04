@@ -11,8 +11,6 @@ segments as one of its backends.
 """
 
 import pytest
-from spy_store import CountingStore
-
 from aether.data.rees46 import iter_events
 from aether.index.memory import MemoryIndex, build_index
 from aether.index.segment import (
@@ -26,7 +24,7 @@ from aether.index.segment import (
     write_segment,
     write_segment_file,
 )
-from aether.storage import LocalStore
+from aether.storage import CountingStore, LocalStore
 
 
 @pytest.fixture
@@ -215,18 +213,18 @@ def test_rejects_an_unsupported_version(index):
 def test_opening_costs_two_requests(store):
     """Footer, then the hotcache it points at. Nothing else."""
     SegmentReader(store, "s.seg")
-    assert store.reads == 2
+    assert store.stats.requests == 2
 
 
 def test_opening_reads_a_tiny_fraction_of_the_file(store):
     SegmentReader(store, "s.seg")
-    assert store.bytes_read < store.size("s.seg") * 0.25
+    assert store.stats.bytes_read < store.size("s.seg") * 0.25
 
 
 def test_a_term_costs_one_dictionary_read_and_one_postings_read(store, segment):
     store.reset()
     segment.postings("samsung")
-    assert store.reads == 2
+    assert store.stats.requests == 2
 
 
 def test_the_dictionary_block_is_cached_after_first_use(store, segment):
@@ -235,7 +233,7 @@ def test_the_dictionary_block_is_cached_after_first_use(store, segment):
     segment.postings("samsung")
     store.reset()
     segment.postings("samsung")
-    assert store.reads == 1  # postings only; the dictionary block was cached
+    assert store.stats.requests == 1  # postings only; the dictionary block was cached
 
 
 def test_document_frequency_costs_no_postings_read(store, segment):
@@ -244,13 +242,13 @@ def test_document_frequency_costs_no_postings_read(store, segment):
     segment.df("samsung")  # warms the dictionary block
     store.reset()
     assert segment.df("samsung") == 4
-    assert store.reads == 0
+    assert store.stats.requests == 0
 
 
 def test_an_absent_term_costs_at_most_one_read(store, segment):
     store.reset()
     assert segment.postings("helicopter") is None
-    assert store.reads <= 1
+    assert store.stats.requests <= 1
 
 
 def test_documents_in_one_block_cost_one_read(store, segment):
@@ -258,7 +256,7 @@ def test_documents_in_one_block_cost_one_read(store, segment):
     segment.document(0)
     segment.document(1)
     segment.document(2)
-    assert store.reads == 1
+    assert store.stats.requests == 1
 
 
 def test_a_whole_query_costs_a_handful_of_requests(store, segment):
@@ -270,7 +268,7 @@ def test_a_whole_query_costs_a_handful_of_requests(store, segment):
         segment.document(doc_id)
 
     assert hits == [1, 4, 7, 13]
-    assert store.reads <= 6
+    assert store.stats.requests <= 6
 
 
 def test_bytes_read_is_bounded_by_block_size_not_file_size(big_index, tmp_path):
@@ -294,11 +292,11 @@ def test_bytes_read_is_bounded_by_block_size_not_file_size(big_index, tmp_path):
         segment.document(doc_id)
 
     assert hits
-    assert store.bytes_read < store.size("big.seg") * 0.35
+    assert store.stats.bytes_read < store.size("big.seg") * 0.35
 
 
 def test_the_reader_never_fetches_the_whole_file(store):
     """The claim the format exists to support."""
     segment = SegmentReader(store, "s.seg")
     segment.search_and("samsung smartphone")
-    assert store.bytes_read < store.size("s.seg")
+    assert store.stats.bytes_read < store.size("s.seg")
