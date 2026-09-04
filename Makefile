@@ -9,8 +9,13 @@ help:
 test:
 	uv run pytest
 
+# Two steps on purpose. `--wait` considers a container that exited a failure,
+# and createtopic/createbucket are one-shot jobs that exit 0 by design, so
+# waiting on them reports a crash that did not happen. Wait on the long-lived
+# services, then let the init jobs run.
 up:
-	docker compose up -d --wait
+	docker compose up -d --wait redpanda minio
+	docker compose up -d
 	@echo "MinIO      http://localhost:9000   console http://localhost:9001"
 	@echo "Redpanda   localhost:19092         console http://localhost:8080"
 

@@ -36,12 +36,15 @@ services:
     depends_on:
       minio:
         condition: service_healthy
-    entrypoint: >
-      /bin/sh -c "
-      mc alias set local http://minio:9000 aether aethersecret &&
-      mc mb --ignore-existing local/aether &&
-      echo 'bucket ready: aether'
-      "
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        set -e
+        mc alias set local http://minio:9000 aether aethersecret
+        mc mb --ignore-existing local/aether
+        mc ls local/aether > /dev/null
+        echo "bucket ready: aether"
 
   # Redpanda: the Kafka wire protocol in one binary, no ZooKeeper, and around
   # 500MB of RAM. Nothing in this project is Redpanda specific, so the same
@@ -81,12 +84,20 @@ services:
     depends_on:
       redpanda:
         condition: service_healthy
-    entrypoint: >
-      /bin/sh -c "
-      rpk topic create clickstream --partitions 12 --replicas 1
-        --brokers redpanda:9092 || true;
-      echo 'topic ready: clickstream (12 partitions)'
-      "
+    # A literal block, not a folded one. Folding turns a more-indented
+    # continuation into a newline, which the shell reads as a second command;
+    # that silently dropped --brokers and sent rpk to 127.0.0.1 inside a
+    # container with no broker. The create is allowed to fail because the
+    # topic may already exist, but the describe that follows must succeed, so
+    # a genuine failure cannot be reported as success.
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        set -e
+        rpk topic create clickstream --partitions 12 --replicas 1 --brokers redpanda:9092 || true
+        rpk topic describe clickstream --brokers redpanda:9092 > /dev/null
+        echo "topic ready: clickstream (12 partitions)"
 
   # Web UI for the topic: messages, consumer groups, and lag.
   console:

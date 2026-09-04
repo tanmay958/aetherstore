@@ -48,10 +48,16 @@ def _reachable(url: str) -> bool:
 
 
 def _minio() -> S3Store:
+    # Credentials passed explicitly rather than left to boto3's resolution
+    # chain. Without them it finds whatever profile the developer happens to
+    # have configured, which on a machine with an SSO profile fails with a
+    # botocore[crt] dependency error that has nothing to do with MinIO.
     return S3Store(
         MINIO_BUCKET,
         prefix=f"itest/{uuid.uuid4().hex[:8]}",
         endpoint_url=MINIO_ENDPOINT,
+        access_key=os.getenv("AETHER_TEST_MINIO_KEY", "aether"),
+        secret_key=os.getenv("AETHER_TEST_MINIO_SECRET", "aethersecret"),
     )
 
 

@@ -23,9 +23,57 @@ on Cloudflare R2.
 | 0.7 | `S3Store` against MinIO, R2 and S3 | done |
 | 1.0 | Manifest, multi-segment fan-out, time pruning | done |
 | 1.1 | Kafka indexer: idempotent flush, crash recovery | done |
+| 1.2 | Benchmarked on 1M real REES46 events | done |
 
 Later phases add the bloom filter and skip lists, Kafka and the indexer service, the multi-segment query coordinator, compaction, the ML pipeline, and a dashboard.
 Infrastructure comes last on purpose: the segment format needs none of it, and everything downstream is a caller of it.
+
+## Measured
+
+One million real REES46 events, on an M-series laptop. Regenerate with
+`uv run python -m aether.bench data/raw/2019-Oct.csv --events 1000000`.
+
+```
+INDEXING
+  documents        1,000,000
+  segments         100 (10,000 docs each)
+  throughput       62,391 docs/sec   (single threaded, pure Python)
+
+SIZE
+  source           127.4 MB
+  index             95.0 MB   0.75x of source
+    postings          13.7 MB   14.4%
+    docstore          67.5 MB   71.1%
+    termdict           9.5 MB   10.0%
+    hotcache           4.3 MB    4.5%
+  bytes/posting    2.29   (8.00 at fixed width)
+
+QUERIES (warm)               hits  requests       read      ms
+  common, two terms        89,707       200   772.5 KB     256
+  common, one term        386,044       100   754.2 KB     280
+  rare brand                   43        28    154.0 B       6
+  absent term                   0         0      0.0 B       2
+
+TIME PRUNING "samsung smartphone"
+  last hour              10/100 searched     20 requests    24 ms
+  everything            100/100 searched    200 requests   247 ms
+```
+
+Two of these are worth dwelling on.
+
+**2.29 bytes per posting.** The 27-document fixture predicted 2.22. The
+extrapolation held across four and a half orders of magnitude, which is the
+only reason the earlier numbers were worth quoting at all.
+
+**4.3 MB of hotcache avoids reading 95 MB.** That is the whole design in one
+line: a small immutable summary, fetched once and cached forever because a
+segment can never change, standing in for the rest of the index.
+
+And the honest one: an absent term costs zero requests *warm*, but 100
+dictionary reads cold, one per segment, to learn it is not there. A bloom
+filter in the already-cached hotcache would answer that for free. That
+optimization was unmeasurable on 27 documents and is obvious now, which is
+why it was not built earlier.
 
 ## Design
 
@@ -259,6 +307,7 @@ src/aether/
     ├── producer.py    CSV -> Kafka, keyed by session
     ├── partition.py   the indexing core: offsets in, segments out
     └── indexer.py     the consumer service
+bench.py              regenerates every number below
     ├── segment.py     the 5-section binary format and its byte-range reader
     ├── build.py       CSV -> segment file
     └── search.py      query a CSV or a segment
