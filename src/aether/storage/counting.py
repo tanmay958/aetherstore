@@ -23,6 +23,7 @@ S3 later:
 
 from __future__ import annotations
 
+import threading
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Iterator
@@ -71,6 +72,11 @@ class CountingStore(ObjectStore):
         self.stats = ReadStats()
         self.trace = trace
         self.reads: list[Read] = []
+        # The coordinator fans out across segments on a thread pool, so
+        # several reads land here concurrently. Without this the counts drift
+        # low under load, which is the worst possible failure for a number
+        # whose entire job is to be trusted.
+        self._lock = threading.Lock()
 
     def reset(self) -> None:
         self.stats = ReadStats()
@@ -92,10 +98,11 @@ class CountingStore(ObjectStore):
             delta.bytes_read = self.stats.bytes_read - start.bytes_read
 
     def _record(self, key: str, start: int | None, length: int, data: bytes) -> bytes:
-        self.stats.requests += 1
-        self.stats.bytes_read += len(data)
-        if self.trace:
-            self.reads.append(Read(key, start, length, len(data)))
+        with self._lock:
+            self.stats.requests += 1
+            self.stats.bytes_read += len(data)
+            if self.trace:
+                self.reads.append(Read(key, start, length, len(data)))
         return data
 
     def get_range(self, key: str, start: int, length: int) -> bytes:

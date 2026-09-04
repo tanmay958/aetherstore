@@ -1,19 +1,19 @@
-"""Search a REES46 CSV or a prebuilt segment, and report what it cost.
+"""Query an index, a single segment, or a CSV, and report what it cost.
 
-Given a .seg it opens the segment through a counting store; given anything
-else it indexes the CSV in memory first. The query path afterwards is
-identical, because both satisfy SearchableIndex, which is the point: a caller
-never learns where the postings came from.
+Three kinds of target, one query path:
 
-For segments the cost is reported in requests, not only milliseconds. Locally
-every range read is a seek and therefore nearly free, so timings here flatter
-the engine enormously. The request count is the number that carries over to
-object storage unchanged, where each one is a 20-50ms round trip that costs
-money regardless of how many bytes it returns.
+    events.csv                       index it in memory first
+    out.seg                          one segment, read by byte range
+    data/idx  |  r2://aether/idx     a whole index: manifest, many segments
 
-    python -m aether.index.search events.csv "samsung smartphone"
-    python -m aether.index.search out.seg "samsung smartphone"
-    python -m aether.index.search r2://aether/segments/0.seg "samsung smartphone"
+Costs are reported in requests, not only milliseconds. Against local files
+every read is a seek and the timings flatter the engine enormously; measured
+from a laptop, R2 answers a range read in roughly 200 ms regardless of whether
+it returns 64 bytes or 4 kilobytes. The request count is the number that
+carries over unchanged, and it is what you pay in both latency and money.
+
+    python -m aether.index.search data/idx "samsung smartphone"
+    python -m aether.index.search r2://aether/idx "samsung" --or --global-stats
 """
 
 from __future__ import annotations
@@ -23,109 +23,166 @@ import time
 from pathlib import Path
 
 from aether.data.rees46 import iter_events
+from aether.env import load_dotenv
 from aether.index.analyzer import tokenize
-from aether.index.base import SearchableIndex
+from aether.index.coordinator import Coordinator
 from aether.index.memory import build_index
 from aether.index.segment import SegmentReader
-from aether.storage import CountingStore, LocalStore, ReadStats, open_object
-from aether.env import load_dotenv
+from aether.storage import CountingStore, ReadStats, open_object, open_store
 
 
-def load(target: str) -> tuple[SearchableIndex, str, CountingStore | None, str]:
-    """Open a segment through a counting store, or index a CSV in memory."""
-    if target.endswith(".seg"):
-        inner, key = open_object(target)
-        store = CountingStore(inner)
-        return SegmentReader(store, key), "segment", store, key
-    return build_index(iter_events(Path(target))), "memory index", None, ""
+def _describe(doc: dict) -> str:
+    title = doc["title"] or "(no title)"
+    price = f"${doc['price']:,.2f}" if doc["price"] is not None else ""
+    return (
+        f"{title:<42} {doc['event_type']:<16} "
+        f"{doc['category'] or '':<28} {price:>10}"
+    )
+
+
+def _snapshot(store: CountingStore | None) -> ReadStats:
+    return ReadStats(store.stats.requests, store.stats.bytes_read) if store else ReadStats()
+
+
+def run_index(target: str, args) -> int:
+    """A manifest and many segments."""
+    store = CountingStore(open_store(target))
+    coordinator = Coordinator(store, max_workers=args.workers)
+
+    manifest = coordinator.manifest
+    if not manifest.segments:
+        print(f"no manifest at {target}. Build one with: python -m aether.index.ingest")
+        return 1
+
+    open_cost = _snapshot(store)
+    print(
+        f"index: {len(manifest.segments):,} segments, {manifest.docs:,} docs, "
+        f"{manifest.bytes:,} B   generation {manifest.generation}"
+    )
+    print(f"       manifest read: {open_cost}")
+    print()
+    print(f'query "{args.query}"  ->  {tokenize(args.query)}')
+
+    result = coordinator.search(
+        args.query,
+        top_k=args.top,
+        mode="or" if args.use_or else "and",
+        start=args.since,
+        end=args.until,
+        global_stats=args.global_stats,
+    )
+    search_cost = _snapshot(store)
+
+    print(f"    {result.stats}")
+    print(f"    {result.total:,} matching documents")
+    print()
+    if not result.hits:
+        print("  no matches")
+        return 0
+
+    docs = coordinator.documents(result.hits)
+    fetch_cost = ReadStats(
+        store.stats.requests - search_cost.requests,
+        store.stats.bytes_read - search_cost.bytes_read,
+    )
+
+    print(f"  {'score':>7}  {'doc':>6}  {'segment':<22} title")
+    for hit, doc in zip(result.hits, docs):
+        segment = hit.segment.rsplit("/", 1)[-1][:22]
+        print(f"  {hit.score:>7.3f}  {hit.doc_id:>6}  {segment:<22} {_describe(doc)}")
+    if result.total > len(result.hits):
+        print(f"  ... and {result.total - len(result.hits):,} more")
+
+    print()
+    print("  storage cost")
+    print(f"    manifest         {open_cost}")
+    print(f"    search           {ReadStats(search_cost.requests - open_cost.requests, search_cost.bytes_read - open_cost.bytes_read)}")
+    print(f"    fetch {len(docs):>2} docs     {fetch_cost}")
+    print(f"    total            {store.stats}")
+    return 0
+
+
+def run_segment(target: str, args) -> int:
+    """One segment."""
+    inner, key = open_object(target)
+    store = CountingStore(inner)
+    segment = SegmentReader(store, key)
+    open_cost = _snapshot(store)
+
+    print(
+        f"segment: {segment.num_docs:,} docs, {segment.num_terms:,} terms, "
+        f"{segment.num_postings:,} postings"
+    )
+    print(f"       open cost: {open_cost}")
+    print()
+    print(f'query "{args.query}"  ->  {tokenize(args.query)}')
+
+    began = time.perf_counter()
+    result = segment.search(args.query, top_k=args.top, mode="or" if args.use_or else "and")
+    print(f"    {result.total:,} docs in {(time.perf_counter() - began) * 1000:.1f} ms")
+    print()
+    if not result.hits:
+        print("  no matches")
+        return 0
+
+    print(f"  {'score':>7}  {'doc':>6}  title")
+    for hit in result.hits:
+        print(f"  {hit.score:>7.3f}  {hit.doc_id:>6}  {_describe(segment.document(hit.doc_id))}")
+    print()
+    print(f"  storage cost     {store.stats}  (segment is {store.size(key):,} B)")
+    return 0
+
+
+def run_csv(target: str, args) -> int:
+    """A CSV, indexed in memory. No storage cost to report."""
+    began = time.perf_counter()
+    index = build_index(iter_events(Path(target)))
+    print(
+        f"memory index: {index.num_docs:,} docs, {index.num_terms:,} terms   "
+        f"built in {(time.perf_counter() - began) * 1000:,.1f} ms"
+    )
+    print()
+    print(f'query "{args.query}"  ->  {tokenize(args.query)}')
+
+    result = index.search(args.query, top_k=args.top, mode="or" if args.use_or else "and")
+    print(f"    {result.total:,} matching documents")
+    print()
+    for hit in result.hits:
+        print(f"  {hit.score:>7.3f}  {hit.doc_id:>6}  {_describe(index.document(hit.doc_id))}")
+    return 0 if result.hits else 0
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="aether.index.search",
-        description="Build or open an index and query it.",
+        description="Query an index, a segment, or a CSV.",
     )
-    parser.add_argument(
-        "input", help="a REES46 .csv/.csv.gz, or a .seg path or s3://|r2:// URI"
-    )
+    parser.add_argument("target", help="a CSV, a .seg, or an index prefix")
     parser.add_argument("query", help="search terms")
-    parser.add_argument(
-        "--or", dest="use_or", action="store_true", help="match any term instead of all"
-    )
+    parser.add_argument("--or", dest="use_or", action="store_true", help="match any term")
     parser.add_argument("--top", type=int, default=10, help="results to display")
+    parser.add_argument("--since", type=int, default=None, help="epoch lower bound")
+    parser.add_argument("--until", type=int, default=None, help="epoch upper bound")
+    parser.add_argument(
+        "--global-stats",
+        action="store_true",
+        help="score against corpus-wide document frequencies: correct across "
+        "segments, at the price of a second wave of requests",
+    )
+    parser.add_argument("--workers", type=int, default=16, help="fan-out concurrency")
     args = parser.parse_args(argv)
     load_dotenv()
 
-    if "://" not in args.input and not Path(args.input).exists():
-        parser.error(f"{args.input} not found. See docs/DATA.md for how to get it.")
+    target = args.target
+    local = "://" not in target
+    if local and not Path(target).exists():
+        parser.error(f"{target} not found. See docs/DATA.md for how to get it.")
 
-    started = time.perf_counter()
-    index, kind, store, key = load(args.input)
-    open_ms = (time.perf_counter() - started) * 1000
-    # A snapshot, not the live object: store.stats keeps accumulating.
-    open_cost = ReadStats(store.stats.requests, store.stats.bytes_read) if store else None
-
-    print(
-        f"{kind}: {index.num_docs:,} docs, {index.num_terms:,} terms, "
-        f"{index.num_postings:,} postings   opened in {open_ms:,.1f} ms"
-    )
-    print(f"       {index.avg_doc_length:.1f} terms per document on average")
-    print()
-
-    terms = tokenize(args.query)
-    if not terms:
-        print(f'query "{args.query}" contains no indexable terms')
-        return 1
-
-    print(f'query "{args.query}"  ->  {terms}')
-
-    # Costs are gathered per stage so the report separates what is paid once
-    # from what is paid on every query.
-    noop = CountingStore(LocalStore(".")) if store is None else store
-    with noop.measure() as lookup_cost:
-        term_dfs = [(term, index.df(term)) for term in terms]
-
-    for term, df in term_dfs:
-        note = "  (not in index)" if df == 0 else ""
-        print(f"    {term:<20} df {df:>6,}{note}")
-
-    mode = "or" if args.use_or else "and"
-    with noop.measure() as match_cost:
-        started = time.perf_counter()
-        result = index.search(args.query, top_k=args.top, mode=mode)
-        query_ms = (time.perf_counter() - started) * 1000
-
-    label = "OR " if args.use_or else "AND"
-    print(f"    {label:<20} {result.total:>6,} docs in {query_ms:.3f} ms")
-    print()
-
-    if not result.hits:
-        print("  no matches")
-        return 0
-
-    with noop.measure() as fetch_cost:
-        shown = [(hit, index.document(hit.doc_id)) for hit in result.hits]
-
-    print(f"  {'score':>7}  {'doc':>6}  title")
-    for hit, doc in shown:
-        title = doc["title"] or "(no title)"
-        price = f"${doc['price']:,.2f}" if doc["price"] is not None else ""
-        print(
-            f"  {hit.score:>7.3f}  {hit.doc_id:>6}  {title:<42} "
-            f"{doc['event_type']:<16} {doc['category'] or '':<28} {price:>10}"
-        )
-    if result.total > len(result.hits):
-        print(f"  ... and {result.total - len(result.hits):,} more")
-
-    if store is not None:
-        print()
-        print("  storage cost")
-        print(f"    open (once)      {open_cost}")
-        print(f"    term lookup      {lookup_cost}")
-        print(f"    posting lists    {match_cost}")
-        print(f"    fetch {len(shown):>2} docs     {fetch_cost}")
-        print(f"    segment size     {store.size(key):,} B")
-    return 0
+    if target.endswith(".seg"):
+        return run_segment(target, args)
+    if local and Path(target).is_file():
+        return run_csv(target, args)
+    return run_index(target, args)
 
 
 if __name__ == "__main__":

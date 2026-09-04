@@ -27,6 +27,27 @@ Mode = Literal["and", "or"]
 
 
 @dataclass(frozen=True)
+class CorpusStats:
+    """Collection-wide statistics to score against, overriding a segment's own.
+
+    BM25 asks two questions about the collection: how many documents are in
+    it, and how many of them contain this term. A single segment can only
+    answer for itself, and its answers are wrong for an index made of many
+    segments. A term appearing in three documents of a small segment looks
+    rare there and common in a large one, so the same document earns
+    different scores depending on which segment it happened to land in.
+
+    Supplying these makes every segment score against the same denominator,
+    at the cost of an extra round trip to collect them first. See
+    `Coordinator.search`, which offers both and explains the trade.
+    """
+
+    num_docs: int
+    avg_doc_length: float
+    dfs: dict[str, int]
+
+
+@dataclass(frozen=True)
 class Hit:
     """One ranked result."""
 
@@ -109,7 +130,7 @@ class SearchableIndex(ABC):
 
     def _postings_for(
         self, query: str, *, require_all: bool
-    ) -> tuple[list[PostingList], bool]:
+    ) -> tuple[list[tuple[str, PostingList]], bool]:
         """Posting lists for the query's terms, fetched once each.
 
         Fetched once matters on a segment, where every call is a request.
@@ -117,36 +138,38 @@ class SearchableIndex(ABC):
         fetching the rest, because one absent term collapses a conjunction and
         the remaining reads would buy nothing.
         """
-        lists: list[PostingList] = []
+        lists: list[tuple[str, PostingList]] = []
         for term in sorted(set(tokenize(query))):
             posting_list = self.postings(term)
             if posting_list is None:
                 if require_all:
                     return [], False
                 continue
-            lists.append(posting_list)
+            # The term travels with its postings because global scoring needs
+            # to look up a corpus-wide document frequency by name.
+            lists.append((term, posting_list))
         return lists, True
 
     # -- matching ----------------------------------------------------------
 
     @staticmethod
-    def _intersect_all(lists: list[PostingList]) -> list[int]:
+    def _intersect_all(lists: list[tuple[str, PostingList]]) -> list[int]:
         """Shortest list first. An intersection can only shrink, so starting
         from the rarest term keeps every subsequent walk as short as possible:
         pairing a 3-document list with a 50,000-document one costs 50,003
         steps, while two 50,000-document lists cost 100,000."""
-        ordered = sorted(lists, key=lambda posting_list: posting_list.df)
-        result = ordered[0].doc_ids
-        for posting_list in ordered[1:]:
+        ordered = sorted(lists, key=lambda pair: pair[1].df)
+        result = ordered[0][1].doc_ids
+        for _, posting_list in ordered[1:]:
             result = intersect(result, posting_list.doc_ids)
             if not result:
                 break
         return list(result)
 
     @staticmethod
-    def _union_all(lists: list[PostingList]) -> list[int]:
+    def _union_all(lists: list[tuple[str, PostingList]]) -> list[int]:
         result: list[int] = []
-        for posting_list in lists:
+        for _, posting_list in lists:
             result = union(result, posting_list.doc_ids)
         return result
 
@@ -171,6 +194,7 @@ class SearchableIndex(ABC):
         top_k: int = 10,
         mode: Mode = "and",
         scorer: BM25 = DEFAULT_SCORER,
+        corpus: CorpusStats | None = None,
     ) -> SearchResult:
         """The best `top_k` documents for a query, most relevant first.
 
@@ -192,7 +216,7 @@ class SearchableIndex(ABC):
         if not candidates:
             return SearchResult([], 0)
 
-        scores = self._accumulate(lists, candidates, scorer)
+        scores = self._accumulate(lists, candidates, scorer, corpus)
         # Negated so the heap sorts descending by score, and ties fall back to
         # ascending document id, which keeps results stable run to run.
         ranked = heapq.nsmallest(
@@ -203,7 +227,11 @@ class SearchableIndex(ABC):
         )
 
     def _accumulate(
-        self, lists: list[PostingList], candidates: list[int], scorer: BM25
+        self,
+        lists: list[tuple[str, PostingList]],
+        candidates: list[int],
+        scorer: BM25,
+        corpus: CorpusStats | None = None,
     ) -> dict[int, float]:
         """Sum each term's contribution across the candidate documents.
 
@@ -211,15 +239,18 @@ class SearchableIndex(ABC):
         frequency for each candidate is found by the same merge walk the
         intersection uses, rather than by building a lookup table.
         """
-        num_docs = self.num_docs
-        avg_length = self.avg_doc_length
+        num_docs = corpus.num_docs if corpus else self.num_docs
+        avg_length = corpus.avg_doc_length if corpus else self.avg_doc_length
         scores = dict.fromkeys(candidates, 0.0)
 
-        for posting_list in lists:
+        for term, posting_list in lists:
+            # Corpus-wide document frequency when supplied, so segments score
+            # against the same denominator; otherwise this segment's own.
+            df = corpus.dfs.get(term, posting_list.df) if corpus else posting_list.df
             # No short-circuit on a small idf: a term present in every
             # document scores near zero but not at zero, and dropping it would
             # change results rather than only saving work.
-            idf = scorer.idf(num_docs, posting_list.df)
+            idf = scorer.idf(num_docs, df)
             doc_ids, freqs = posting_list.doc_ids, posting_list.freqs
             i = j = 0
             len_postings, len_candidates = len(doc_ids), len(candidates)

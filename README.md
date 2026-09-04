@@ -8,7 +8,8 @@ Not a wrapper around Elasticsearch. The segment format, the postings codec, the 
 
 ## Status
 
-**Phase 0 complete.** The storage engine works end to end, locally and on object storage.
+**Phase 0 complete**, plus the multi-segment coordinator. Searches a real index
+on Cloudflare R2.
 
 | Step | | |
 |---|---|---|
@@ -20,6 +21,7 @@ Not a wrapper around Elasticsearch. The segment format, the postings codec, the 
 | 0.5 | Delta encoding and varint compression | done |
 | 0.6 | BM25 scoring | done |
 | 0.7 | `S3Store` against MinIO, R2 and S3 | done |
+| 1.0 | Manifest, multi-segment fan-out, time pruning | done |
 
 Later phases add the bloom filter and skip lists, Kafka and the indexer service, the multi-segment query coordinator, compaction, the ML pipeline, and a dashboard.
 Infrastructure comes last on purpose: the segment format needs none of it, and everything downstream is a caller of it.
@@ -135,6 +137,47 @@ dictionary block, term frequency, which arrived with the postings, and document
 length, which arrived with the hotcache. All three were recorded in earlier
 steps for this moment.
 
+### Many segments
+
+An index is a pile of segments, and a manifest says which ones count. Writing a
+segment does not make it searchable; naming it in the manifest does, which is
+how a storage system with no transactions still gets atomic publication.
+
+```
+uv run python -m aether.index.ingest events.csv r2://aether/idx --docs-per-segment 5000
+uv run python -m aether.index.search r2://aether/idx "samsung smartphone"
+```
+
+Fan-out is on a thread pool, because the engine is not CPU bound and never was.
+Measured against real R2 from a laptop, four segments:
+
+```
+--workers 1     3,886 ms     20 requests
+--workers 16    1,254 ms     20 requests
+```
+
+Same cost in requests and money, 3.1x the speed. Time pruning is cheaper still:
+the manifest carries each segment's time span, so a query outside it discards
+whole segments for **zero** requests.
+
+### Scoring across segments
+
+BM25 asks how many documents are in the collection and how many contain the
+term. A segment can only answer for itself, so identical documents score
+differently depending on which segment they landed in:
+
+```
+              local stats      global stats
+  doc 5          3.967             3.803
+  doc 1          1.772             3.927
+```
+
+`--global-stats` collects document frequencies from every segment first, so all
+of them score against the same denominator. It costs no extra *requests* --
+document frequency lives in the term dictionary, which scoring reads anyway --
+only a second wave of them in sequence. Elasticsearch makes the same trade under
+the name `dfs_query_then_fetch`, and defaults to local for the same reason.
+
 The score gap above is length normalization at work -- `add_to_cart` tokenizes
 into more terms than `view`, making those documents longer and therefore
 slightly less relevant per match.
@@ -174,6 +217,9 @@ src/aether/
     ├── memory.py      in-memory inverted index, the correctness oracle
     ├── codec.py       delta encoding and varints for posting lists
     ├── scorer.py      BM25 relevance scoring
+    ├── manifest.py    which segments are live: the commit point
+    ├── coordinator.py fan out across segments, prune, merge
+    ├── ingest.py      CSV -> many segments + manifest
     ├── segment.py     the 5-section binary format and its byte-range reader
     ├── build.py       CSV -> segment file
     └── search.py      query a CSV or a segment
