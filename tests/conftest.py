@@ -38,7 +38,7 @@ def sample_csv_gz(sample_csv: Path, tmp_path: Path) -> Path:
 
 
 @pytest.fixture(params=["memory", "segment"])
-def backend(request, sample_csv):
+def backend(request, sample_csv, tmp_path):
     """Every index implementation, one at a time.
 
     Contract tests take this fixture and therefore run against all of them.
@@ -49,8 +49,12 @@ def backend(request, sample_csv):
     from aether.data.rees46 import iter_events
     from aether.index.memory import build_index
     from aether.index.segment import SegmentReader, write_segment
+    from aether.storage import LocalStore
 
     index = build_index(iter_events(sample_csv))
     if request.param == "memory":
         return index
-    return SegmentReader.from_bytes(write_segment(index))
+
+    store = LocalStore(tmp_path)
+    store.put("fixture.seg", write_segment(index))
+    return SegmentReader(store, "fixture.seg")

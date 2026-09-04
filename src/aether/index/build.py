@@ -11,7 +11,7 @@ from pathlib import Path
 
 from aether.data.rees46 import iter_events
 from aether.index.memory import build_index
-from aether.index.segment import write_segment_file
+from aether.index.segment import FOOTER_SIZE, SegmentReader, write_segment_file
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -36,6 +36,8 @@ def main(argv: list[str] | None = None) -> int:
     write_ms = (time.perf_counter() - started) * 1000
 
     raw = args.input.stat().st_size
+    footer = SegmentReader.open(args.output).footer
+
     print(f"wrote {args.output}")
     print(f"  documents      {index.num_docs:,}")
     print(f"  terms          {index.num_terms:,}")
@@ -43,10 +45,22 @@ def main(argv: list[str] | None = None) -> int:
     print(f"  avg doc length {index.avg_doc_length:.1f} terms")
     print(f"  indexed in     {build_ms:,.1f} ms")
     print(f"  written in     {write_ms:,.1f} ms")
+    print()
     print(f"  segment size   {written:,} B")
-    # Worth watching from here on. JSON has no business winning this, and it
-    # does not; step 5 is where the number starts moving in the right
-    # direction.
+    for name, size in (
+        ("postings", footer.postings_length),
+        ("docstore", footer.docstore_length),
+        ("termdict", footer.termdict_length),
+        ("hotcache", footer.hotcache_length),
+        ("footer", FOOTER_SIZE),
+    ):
+        # The hotcache is the number to watch: it is read once per segment and
+        # then cached forever, so it is the memory price of never having to
+        # fetch the rest.
+        print(f"    {name:<12} {size:>10,} B  {100 * size / written:>5.1f}%")
+    print()
+    # Step 5 is where this number starts moving in the right direction:
+    # postings are still plain 32-bit ints and the docstore is raw JSON.
     print(f"  source size    {raw:,} B  ({written / raw:.2f}x)")
     return 0
 

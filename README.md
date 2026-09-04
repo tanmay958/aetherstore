@@ -8,15 +8,15 @@ Not a wrapper around Elasticsearch. The segment format, the postings codec, the 
 
 ## Status
 
-Phase 0, step 2 of 8: **segment round-trip**.
+Phase 0, step 3 of 8: **byte-range reads**.
 
 | Step | | |
 |---|---|---|
 | 0.0 | Data ingestion: REES46 loader, slicer, schema | done |
 | 0.1 | In-memory inverted index (the brute-force oracle) | done |
 | 0.2 | Serialize and round-trip a segment to a file | done |
-| 0.3 | Real 5-section layout, read only via byte ranges | next |
-| 0.4 | Read counter: requests and bytes per query | |
+| 0.3 | Real 5-section layout, read only via byte ranges | done |
+| 0.4 | Read counter: requests and bytes per query | next |
 | 0.5 | Delta encoding and varint compression | |
 | 0.6 | BM25 scoring | |
 | 0.7 | `S3Store` against MinIO, one config line | |
@@ -94,8 +94,18 @@ uv run python -m aether.index.build tests/fixtures/rees46_sample.csv out.seg
 uv run python -m aether.index.search out.seg "samsung smartphone"
 ```
 
-The segment is currently **2.3x larger than its own source data**, because the
-body is still JSON. That is the baseline step 5 has to beat.
+```
+  segment size   10,866 B
+    postings          1,640 B   15.1%
+    docstore          7,964 B   73.3%
+    termdict            972 B    8.9%
+    hotcache            174 B    1.6%
+    footer              116 B    1.1%
+```
+
+Note the hotcache: 174 bytes, read once and cached forever, which is the entire
+price of never fetching the other 98%. And note the docstore at 73% -- still raw
+JSON, which is what step 5 is for.
 
 To work with real data, see [docs/DATA.md](docs/DATA.md).
 
@@ -108,12 +118,15 @@ src/aether/
 │   ├── rees46.py      streaming CSV -> canonical events (.csv and .csv.gz)
 │   ├── titles.py      deterministic product titles derived from product_id
 │   └── slice.py       carve a whole-session slice out of the full file
+├── storage/
+│   ├── base.py        ObjectStore: get_range, get_suffix, put
+│   └── local.py       filesystem-backed, stands in for S3/R2
 └── index/
     ├── analyzer.py    text -> index terms
     ├── postings.py    posting lists, intersect and union merge walks
     ├── base.py        the read interface every backend satisfies
     ├── memory.py      in-memory inverted index, the correctness oracle
-    ├── segment.py     an index serialized into one self-contained file
+    ├── segment.py     the 5-section binary format and its byte-range reader
     ├── build.py       CSV -> segment file
     └── search.py      query a CSV or a segment
 tests/
