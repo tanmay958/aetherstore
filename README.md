@@ -8,14 +8,14 @@ Not a wrapper around Elasticsearch. The segment format, the postings codec, the 
 
 ## Status
 
-Phase 0, step 1 of 8: **the in-memory index**.
+Phase 0, step 2 of 8: **segment round-trip**.
 
 | Step | | |
 |---|---|---|
 | 0.0 | Data ingestion: REES46 loader, slicer, schema | done |
 | 0.1 | In-memory inverted index (the brute-force oracle) | done |
-| 0.2 | Serialize and round-trip a segment to a file | next |
-| 0.3 | Real 5-section layout, read only via byte ranges | |
+| 0.2 | Serialize and round-trip a segment to a file | done |
+| 0.3 | Real 5-section layout, read only via byte ranges | next |
 | 0.4 | Read counter: requests and bytes per query | |
 | 0.5 | Delta encoding and varint compression | |
 | 0.6 | BM25 scoring | |
@@ -87,6 +87,16 @@ query "samsung smartphone"  ->  ['samsung', 'smartphone']
   ...
 ```
 
+Build a segment and search that instead:
+
+```
+uv run python -m aether.index.build tests/fixtures/rees46_sample.csv out.seg
+uv run python -m aether.index.search out.seg "samsung smartphone"
+```
+
+The segment is currently **2.3x larger than its own source data**, because the
+body is still JSON. That is the baseline step 5 has to beat.
+
 To work with real data, see [docs/DATA.md](docs/DATA.md).
 
 ## Layout
@@ -100,8 +110,12 @@ src/aether/
 │   └── slice.py       carve a whole-session slice out of the full file
 └── index/
     ├── analyzer.py    text -> index terms
+    ├── postings.py    posting lists, intersect and union merge walks
+    ├── base.py        the read interface every backend satisfies
     ├── memory.py      in-memory inverted index, the correctness oracle
-    └── search.py      build an index and query it from the command line
+    ├── segment.py     an index serialized into one self-contained file
+    ├── build.py       CSV -> segment file
+    └── search.py      query a CSV or a segment
 tests/
 ├── fixtures/          small REES46-schema CSV, committed, all edge cases
 └── test_*.py

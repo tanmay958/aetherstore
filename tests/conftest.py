@@ -35,3 +35,22 @@ def sample_csv_gz(sample_csv: Path, tmp_path: Path) -> Path:
     with sample_csv.open("rb") as src, gzip.open(target, "wb") as dst:
         shutil.copyfileobj(src, dst)
     return target
+
+
+@pytest.fixture(params=["memory", "segment"])
+def backend(request, sample_csv):
+    """Every index implementation, one at a time.
+
+    Contract tests take this fixture and therefore run against all of them.
+    The point is that a new backend is proven against the brute-force scan the
+    moment it exists: when the byte-range reader arrives in step 3, it joins
+    this list and inherits the entire suite.
+    """
+    from aether.data.rees46 import iter_events
+    from aether.index.memory import build_index
+    from aether.index.segment import SegmentReader, write_segment
+
+    index = build_index(iter_events(sample_csv))
+    if request.param == "memory":
+        return index
+    return SegmentReader.from_bytes(write_segment(index))
