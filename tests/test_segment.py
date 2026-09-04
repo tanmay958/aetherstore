@@ -151,6 +151,58 @@ def test_round_trips_an_empty_index(tmp_path):
 
 
 # --------------------------------------------------------------------------
+# compression
+# --------------------------------------------------------------------------
+
+
+def test_postings_cost_less_than_fixed_width(index, segment):
+    """A posting is an id plus a frequency, so 8 bytes each stored plainly."""
+    per_posting = segment.footer.postings_length / index.num_postings
+    assert per_posting < 8.0
+
+
+def test_dense_postings_approach_one_byte_per_document(tmp_path):
+    """The case delta encoding is built for: a term in consecutive documents
+    produces a run of gaps all equal to 1, and a varint of 1 is one byte."""
+    docs = [{"title": f"ubiquitous unique{i}", "ts": 1_700_000_000 + i} for i in range(500)]
+    index = build_index(docs)
+
+    store = LocalStore(tmp_path)
+    store.put("dense.seg", write_segment(index))
+    segment = SegmentReader(store, "dense.seg")
+
+    # "ubiquitous" is in every document, so its 500 gaps are all 1.
+    _, _, length = segment._entry("ubiquitous")
+    assert length / 500 < 2.5
+    assert segment.postings("ubiquitous").doc_ids == list(range(500))
+
+
+def test_docstore_blocks_are_deflated(index, tmp_path):
+    """Compressed per block rather than per document, so the algorithm can
+    exploit every document repeating the same JSON field names."""
+    import zlib
+
+    data = write_segment(index)
+    store = LocalStore(tmp_path)
+    store.put("c.seg", data)
+    segment = SegmentReader(store, "c.seg")
+
+    _, offset, length = segment._doc_blocks[0]
+    raw = data[offset : offset + length]
+    assert zlib.decompress(raw)  # it is deflate, not plain JSON
+    assert len(zlib.decompress(raw)) > len(raw) * 2
+
+
+def test_compression_does_not_change_any_answer(index, segment):
+    """The only acceptable outcome: smaller, and identical."""
+    for term in index.terms():
+        assert segment.postings(term).doc_ids == index.postings(term).doc_ids
+        assert segment.postings(term).freqs == index.postings(term).freqs
+    for doc_id in range(index.num_docs):
+        assert segment.document(doc_id) == index.document(doc_id)
+
+
+# --------------------------------------------------------------------------
 # the footer
 # --------------------------------------------------------------------------
 

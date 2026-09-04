@@ -59,8 +59,11 @@ def main(argv: list[str] | None = None) -> int:
         # fetch the rest.
         print(f"    {name:<12} {size:>10,} B  {100 * size / written:>5.1f}%")
     print()
-    # Step 5 is where this number starts moving in the right direction:
-    # postings are still plain 32-bit ints and the docstore is raw JSON.
+    # The codec metric. A posting is one document id plus one frequency, so
+    # fixed-width 32-bit storage costs 8 bytes; anything below that is what
+    # delta encoding and varints bought.
+    per_posting = footer.postings_length / index.num_postings if index.num_postings else 0
+    print(f"  bytes/posting  {per_posting:.2f}  (8.00 at fixed width)")
     print(f"  source size    {raw:,} B  ({written / raw:.2f}x)")
     return 0
 

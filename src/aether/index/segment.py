@@ -37,10 +37,10 @@ network. A cold segment answers a single-term query in three reads, a warm one
 in a single read, and the two cacheable reads never repeat because the file
 can never change.
 
-What is deliberately still missing: the postings are plain 32-bit integers,
-not delta-encoded or bit-packed, and the docstore is uncompressed. Compression
-is step 5, and keeping it out here means the size drop then is attributable to
-the codec rather than to layout changes.
+Postings are delta-encoded and varint-packed (see `codec.py`), and docstore
+blocks are deflated. The term dictionary is still stored plainly; front coding
+it is a later refinement, and leaving it alone keeps this step's size change
+attributable to the two things that actually changed.
 
     python -m aether.index.build tests/fixtures/rees46_sample.csv out.seg
 """
@@ -49,17 +49,26 @@ from __future__ import annotations
 
 import json
 import struct
+import zlib
 from bisect import bisect_right
 from pathlib import Path
 from typing import Iterable, Iterator
 
 from aether.index.base import SearchableIndex
+from aether.index.codec import (
+    decode_varint,
+    decode_varints,
+    delta_decode,
+    delta_encode,
+    encode_varint,
+    encode_varints,
+)
 from aether.index.postings import PostingList
 from aether.storage.base import ObjectStore
 from aether.storage.local import LocalStore
 
 SEGMENT_MAGIC = b"ATHR"
-SEGMENT_VERSION = 2
+SEGMENT_VERSION = 3
 
 # Terms per dictionary block. Finding a term costs one request for the block
 # containing it, so a larger block means fetching more bytes you will discard
@@ -147,22 +156,27 @@ class Footer:
 
 
 def _encode_postings(doc_ids: list[int], freqs: list[int]) -> bytes:
-    """One term's posting list.
+    """One term's posting list: a count, then ids, then frequencies.
 
-    Ids and frequencies are written as separate runs rather than interleaved,
-    because they compress differently: ids are ascending and delta-encode to
-    almost nothing, while frequencies are small independent integers. Step 5
-    replaces the encoding of each run without touching this arrangement.
+    Ids and frequencies stay in separate runs rather than interleaved because
+    they compress differently. Ids are ascending, so their gaps are tiny and
+    delta encoding collapses them; frequencies are small independent integers
+    that delta encoding would only make worse. Keeping the runs apart lets
+    each use the representation that suits it, and lets either be replaced
+    later without disturbing the other.
     """
-    n = len(doc_ids)
-    return struct.pack(f"<I{n}I{n}I", n, *doc_ids, *freqs)
+    return (
+        encode_varint(len(doc_ids))
+        + encode_varints(delta_encode(doc_ids))
+        + encode_varints(freqs)
+    )
 
 
 def _decode_postings(data: bytes) -> PostingList:
-    (n,) = struct.unpack_from("<I", data)
-    doc_ids = struct.unpack_from(f"<{n}I", data, 4)
-    freqs = struct.unpack_from(f"<{n}I", data, 4 + 4 * n)
-    return PostingList(doc_ids=list(doc_ids), freqs=list(freqs))
+    count, pos = decode_varint(data)
+    gaps, pos = decode_varints(data, count, pos)
+    freqs, _ = decode_varints(data, count, pos)
+    return PostingList(doc_ids=delta_decode(gaps), freqs=freqs)
 
 
 def _encode_dict_block(entries: list[tuple[str, int, int, int]]) -> bytes:
@@ -289,7 +303,15 @@ def write_segment(index: SearchableIndex) -> bytes:
             index.document(i)
             for i in range(first, min(first + DOCS_PER_BLOCK, index.num_docs))
         ]
-        encoded = json.dumps(docs, separators=(",", ":")).encode("utf-8")
+        # Deflated per block rather than per document. Compressing many small
+        # JSON objects together lets the algorithm exploit the fact that every
+        # one of them repeats the same field names, which a document at a time
+        # cannot do. Block size therefore trades compression against read
+        # amplification: a bigger block packs better but drags more unwanted
+        # documents along when one of them is displayed.
+        encoded = zlib.compress(
+            json.dumps(docs, separators=(",", ":")).encode("utf-8"), 6
+        )
         doc_blocks.append((first, len(out), len(encoded)))
         out += encoded
     docstore_length = len(out) - docstore_offset
@@ -423,7 +445,7 @@ class SegmentReader(SearchableIndex):
         if cached is None:
             _, offset, length = self._doc_blocks[block_index]
             cached = self._doc_cache[block_index] = json.loads(
-                self._store.get_range(self._key, offset, length)
+                zlib.decompress(self._store.get_range(self._key, offset, length))
             )
         return cached
 
