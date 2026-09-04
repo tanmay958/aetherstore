@@ -63,7 +63,13 @@ def default_region(endpoint_url: str | None) -> str | None:
     return "us-east-1"
 
 
-def _build_client(endpoint_url: str | None, region: str | None, pool: int) -> Any:
+def _build_client(
+    endpoint_url: str | None,
+    region: str | None,
+    pool: int,
+    access_key: str | None = None,
+    secret_key: str | None = None,
+) -> Any:
     try:
         import boto3
         from botocore.config import Config
@@ -90,10 +96,22 @@ def _build_client(endpoint_url: str | None, region: str | None, pool: int) -> An
         settings["response_checksum_validation"] = "when_required"
         settings["signature_version"] = "s3v4"
 
-    return boto3.client(
+    # A dedicated session per store, rather than the module-level
+    # boto3.client(). That helper resolves credentials once into a
+    # process-wide default session and reuses them, so a process holding two
+    # stores against different backends, say MinIO and R2, would silently sign
+    # both with whichever credentials were resolved first. A per-store session
+    # keeps them independent, and makes rotation take effect.
+    return boto3.session.Session().client(
         "s3",
         endpoint_url=endpoint_url,
         region_name=region,
+        # Left as None unless explicitly supplied, so boto3's normal
+        # resolution order still applies: environment, shared config file,
+        # instance role. Passing keys here is only for callers that read them
+        # from somewhere else, such as R2_ACCESS_KEY_ID.
+        aws_access_key_id=access_key,
+        aws_secret_access_key=secret_key,
         config=Config(**settings),
     )
 
@@ -119,6 +137,8 @@ class S3Store(ObjectStore):
         endpoint_url: str | None = None,
         region: str | None = None,
         client: Any | None = None,
+        access_key: str | None = None,
+        secret_key: str | None = None,
         max_pool_connections: int = 64,
     ) -> None:
         self.bucket = bucket
@@ -126,7 +146,7 @@ class S3Store(ObjectStore):
         self.endpoint_url = endpoint_url or os.getenv("AETHER_S3_ENDPOINT")
         self.region = region or os.getenv("AWS_REGION") or default_region(self.endpoint_url)
         self._client = client or _build_client(
-            self.endpoint_url, self.region, max_pool_connections
+            self.endpoint_url, self.region, max_pool_connections, access_key, secret_key
         )
 
     def _key(self, key: str) -> str:

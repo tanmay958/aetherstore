@@ -56,10 +56,15 @@ def _minio() -> S3Store:
 
 
 def _r2() -> S3Store:
-    from aether.storage.factory import r2_endpoint
+    from aether.storage.factory import r2_credentials, r2_endpoint
 
+    access, secret = r2_credentials()
     return S3Store(
-        R2_BUCKET, prefix=f"itest/{uuid.uuid4().hex[:8]}", endpoint_url=r2_endpoint()
+        R2_BUCKET,
+        prefix=f"itest/{uuid.uuid4().hex[:8]}",
+        endpoint_url=r2_endpoint(),
+        access_key=access,
+        secret_key=secret,
     )
 
 

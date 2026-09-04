@@ -55,15 +55,30 @@ Note that R2 requires a payment method on file even to stay inside the free tier
 
    ```
    export R2_ACCOUNT_ID=your_account_id
-   export AWS_ACCESS_KEY_ID=your_r2_access_key_id
-   export AWS_SECRET_ACCESS_KEY=your_r2_secret_access_key
+   export R2_ACCESS_KEY_ID=your_r2_access_key_id
+   export R2_SECRET_ACCESS_KEY=your_r2_secret_access_key
    ```
+
+   `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` work too, and are what most
+   S3 tooling expects.
 
 5. Check it:
 
    ```
    uv run python -m aether.storage.check r2://aether
    ```
+
+### Why the credentials look like AWS credentials
+
+No AWS account is involved, and these are not AWS credentials.
+They are R2 API tokens issued by Cloudflare.
+
+R2 has no protocol of its own: Cloudflare implemented the S3 API, including AWS Signature V4 request signing.
+So from a client's point of view R2 is S3 at a different hostname, which is why boto3, aws-cli, rclone, and s3cmd all work with it unchanged.
+Those libraries look for `AWS_ACCESS_KEY_ID` because that is the name the SDK defines, not because AWS is on the other end.
+It is the same reason `psql` reaches Postgres, CockroachDB, and Neon through `PGHOST`: the variable names travel with the protocol, not the vendor.
+
+The `R2_`-prefixed aliases exist purely because reading "AWS_ACCESS_KEY_ID" while configuring Cloudflare is confusing.
 
 **Two things this code handles that would otherwise bite you**
 

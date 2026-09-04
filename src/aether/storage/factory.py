@@ -21,6 +21,14 @@ expects:
     R2_ACCOUNT_ID           for r2://, which builds the endpoint from it
     AWS_REGION              optional; "auto" is forced for R2
 
+For r2:// the credentials may also be named R2_ACCESS_KEY_ID and
+R2_SECRET_ACCESS_KEY. They are the same thing: an R2 API token, issued by
+Cloudflare, with no AWS account involved anywhere. The AWS_-prefixed names are
+what every S3 client library looks for, because R2 implements the S3 protocol
+and signs requests with AWS Signature V4, so the SDK conventions come along
+with the protocol. The R2_-prefixed aliases exist only because reading
+"AWS_ACCESS_KEY_ID" while configuring Cloudflare is reliably confusing.
+
 See docs/STORAGE.md for the R2 and MinIO setup.
 """
 
@@ -54,6 +62,17 @@ def r2_endpoint() -> str:
     return f"https://{account}.r2.cloudflarestorage.com"
 
 
+def r2_credentials() -> tuple[str | None, str | None]:
+    """R2 API token, under either naming.
+
+    Returns (None, None) when nothing R2-specific is set, which leaves boto3
+    to resolve credentials the way it normally would.
+    """
+    access = os.getenv("R2_ACCESS_KEY_ID")
+    secret = os.getenv("R2_SECRET_ACCESS_KEY")
+    return (access, secret) if access and secret else (None, None)
+
+
 def open_store(uri: str | Path) -> ObjectStore:
     """Build the store a URI names, treating any trailing path as a prefix."""
     text = str(uri)
@@ -64,8 +83,16 @@ def open_store(uri: str | Path) -> ObjectStore:
 
         if not parsed.netloc:
             raise ValueError(f"{text!r} names no bucket; expected s3://bucket/prefix")
-        endpoint = r2_endpoint() if parsed.scheme == "r2" else None
-        return S3Store(parsed.netloc, prefix=parsed.path.lstrip("/"), endpoint_url=endpoint)
+        if parsed.scheme == "r2":
+            access, secret = r2_credentials()
+            return S3Store(
+                parsed.netloc,
+                prefix=parsed.path.lstrip("/"),
+                endpoint_url=r2_endpoint(),
+                access_key=access,
+                secret_key=secret,
+            )
+        return S3Store(parsed.netloc, prefix=parsed.path.lstrip("/"))
 
     if parsed.scheme == "file":
         return LocalStore(parsed.path)
