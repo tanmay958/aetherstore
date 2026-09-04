@@ -1,0 +1,14 @@
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+*.egg-info/
+
+# Local datasets, slices, and generated index files.
+# Leading slash matters: this must ignore the repo-root data/ directory
+# without touching src/aether/data/, which is source code.
+/data/
+*.seg
+
+# Personal working notes, kept local.
+learnt.txt
