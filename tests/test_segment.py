@@ -426,3 +426,86 @@ def test_the_filter_never_hides_a_real_term(index, segment):
     matching documents and look like bad relevance rather than a bug."""
     for term in index.terms():
         assert segment.contains(term), term
+
+
+# --------------------------------------------------------------------------
+# the term dictionary
+# --------------------------------------------------------------------------
+
+
+def test_dictionary_round_trips():
+    from aether.index.segment import _decode_dict_block, _encode_dict_block
+
+    entries = [("running", 5, 0, 10), ("runs", 3, 10, 6), ("rust", 9, 16, 4)]
+    decoded = _decode_dict_block(_encode_dict_block(entries))
+    assert decoded == {"running": (5, 0, 10), "runs": (3, 10, 6), "rust": (9, 16, 4)}
+
+
+def test_front_coding_shrinks_shared_prefixes():
+    """Sorted terms share prefixes, and half the term bytes in a real segment
+    are shareable."""
+    from aether.index.segment import _encode_dict_block
+
+    shared = [(f"electronics{i:03d}", 1, i * 4, 4) for i in range(32)]
+    distinct = [(f"{chr(97 + i)}zzzzzzzzzzzz{i:03d}", 1, i * 4, 4) for i in range(26)]
+    per_shared = len(_encode_dict_block(shared)) / len(shared)
+    per_distinct = len(_encode_dict_block(distinct)) / len(distinct)
+    assert per_shared < per_distinct
+
+
+@pytest.mark.parametrize(
+    "terms",
+    [
+        ["a", "b", "c"],                       # nothing shared
+        ["aaa", "aaa1", "aaa12"],              # each extends the last
+        ["prefix", "prefixed", "prefixes"],    # deep sharing
+        ["été", "étée"],  # multi-byte utf-8
+        ["only"],                              # single entry
+    ],
+)
+def test_front_coding_handles_awkward_term_sets(terms):
+    from aether.index.segment import _decode_dict_block, _encode_dict_block
+
+    entries = [(term, i + 1, i * 8, 8) for i, term in enumerate(sorted(terms))]
+    decoded = _decode_dict_block(_encode_dict_block(entries))
+    assert set(decoded) == set(terms)
+    for term, df, offset, length in entries:
+        assert decoded[term] == (df, offset, length)
+
+
+def test_an_empty_dictionary_block_round_trips():
+    from aether.index.segment import _decode_dict_block, _encode_dict_block
+
+    assert _decode_dict_block(_encode_dict_block([])) == {}
+
+
+def test_offsets_are_reconstructed_not_stored():
+    """Posting lists are laid end to end in sorted-term order, so an offset
+    follows from the previous length. What is stored is the difference from
+    that prediction, which is zero today and costs one byte, so an encoder
+    that ever lays them out differently cannot silently corrupt the index."""
+    from aether.index.segment import _decode_dict_block, _encode_dict_block
+
+    contiguous = [("aa", 1, 0, 100), ("ab", 1, 100, 50), ("ac", 1, 150, 25)]
+    gapped = [("aa", 1, 0, 100), ("ab", 1, 500, 50), ("ac", 1, 9000, 25)]
+
+    assert len(_encode_dict_block(contiguous)) < len(_encode_dict_block(gapped))
+    assert _decode_dict_block(_encode_dict_block(gapped)) == {
+        "aa": (1, 0, 100), "ab": (1, 500, 50), "ac": (1, 9000, 25)
+    }
+
+
+def test_each_block_decodes_without_the_one_before_it(big_index, tmp_path):
+    """Blocks are fetched individually, so prefix sharing has to restart at
+    every boundary or a block would be unreadable on its own."""
+    store = LocalStore(tmp_path)
+    store.put("blocks.seg", write_segment(big_index))
+    segment = SegmentReader(store, "blocks.seg")
+    assert len(segment._term_blocks) > 1
+
+    # Read the last block first, having touched nothing before it.
+    last = len(segment._term_blocks) - 1
+    entries = segment._dict_block(last)
+    assert entries
+    for term in entries:
+        assert big_index.postings(term) is not None

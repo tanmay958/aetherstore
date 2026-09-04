@@ -69,7 +69,7 @@ from aether.storage.base import ObjectStore
 from aether.storage.local import LocalStore
 
 SEGMENT_MAGIC = b"ATHR"
-SEGMENT_VERSION = 4
+SEGMENT_VERSION = 5
 
 # Terms per dictionary block. Finding a term costs one request for the block
 # containing it, so a larger block means fetching more bytes you will discard
@@ -187,28 +187,77 @@ def _encode_dict_block(entries: list[tuple[str, int, int, int]]) -> bytes:
     Document frequency lives here rather than only in the postings so that
     `df(term)` costs no extra request: it is already in the block that had to
     be fetched to locate the term at all.
+
+    Three compressions apply, and the largest is the least obvious.
+
+    **Front coding.** The terms are sorted, so neighbours share prefixes. Each
+    entry stores how many leading bytes it shares with its predecessor and
+    only the remainder. Half the term bytes in a real segment are shareable.
+    Sharing restarts at every block boundary, because a block must stay
+    independently readable: it is fetched alone, without the block before it.
+
+    **Derived offsets.** Posting lists are written in sorted-term order and
+    laid end to end, so a term's postings begin exactly where the previous
+    term's ended. The offset is therefore reconstructable rather than stored,
+    which removes eight bytes an entry. What is stored is the difference from
+    that prediction, which is always zero today and costs one byte, so an
+    encoder that ever lays postings out differently cannot silently corrupt
+    the index.
+
+    **Variable-length integers.** Document frequencies and posting lengths are
+    mostly small, and a fixed 32-bit field spends four bytes saying so.
     """
-    out = bytearray(struct.pack("<I", len(entries)))
+    out = bytearray(encode_varint(len(entries)))
+    if not entries:
+        return bytes(out)
+
+    # The block's own starting point, from which every offset in it follows.
+    out += encode_varint(entries[0][2])
+
+    previous_term = ""
+    predicted_offset = entries[0][2]
     for term, df, offset, length in entries:
-        encoded = term.encode("utf-8")
-        out += struct.pack("<H", len(encoded))
-        out += encoded
-        out += struct.pack("<IQI", df, offset, length)
+        shared = 0
+        limit = min(len(previous_term), len(term))
+        while shared < limit and previous_term[shared] == term[shared]:
+            shared += 1
+        suffix = term[shared:].encode("utf-8")
+
+        out += encode_varint(shared)
+        out += encode_varint(len(suffix))
+        out += suffix
+        out += encode_varint(df)
+        out += encode_varint(offset - predicted_offset)
+        out += encode_varint(length)
+
+        previous_term = term
+        predicted_offset = offset + length
     return bytes(out)
 
 
 def _decode_dict_block(data: bytes) -> dict[str, tuple[int, int, int]]:
-    (count,) = struct.unpack_from("<I", data)
-    pos = 4
+    count, pos = decode_varint(data)
+    if not count:
+        return {}
+    block_offset, pos = decode_varint(data, pos)
+
     entries: dict[str, tuple[int, int, int]] = {}
+    previous_term = ""
+    predicted_offset = block_offset
     for _ in range(count):
-        (term_length,) = struct.unpack_from("<H", data, pos)
-        pos += 2
-        term = data[pos : pos + term_length].decode("utf-8")
-        pos += term_length
-        df, offset, length = struct.unpack_from("<IQI", data, pos)
-        pos += 16
+        shared, pos = decode_varint(data, pos)
+        suffix_length, pos = decode_varint(data, pos)
+        term = previous_term[:shared] + data[pos : pos + suffix_length].decode("utf-8")
+        pos += suffix_length
+
+        df, pos = decode_varint(data, pos)
+        gap, pos = decode_varint(data, pos)
+        length, pos = decode_varint(data, pos)
+
+        offset = predicted_offset + gap
         entries[term] = (df, offset, length)
+        previous_term = term
+        predicted_offset = offset + length
     return entries
 
 
