@@ -8,13 +8,13 @@ Not a wrapper around Elasticsearch. The segment format, the postings codec, the 
 
 ## Status
 
-Phase 0, step 0 of 8: **data ingestion**.
+Phase 0, step 1 of 8: **the in-memory index**.
 
 | Step | | |
 |---|---|---|
 | 0.0 | Data ingestion: REES46 loader, slicer, schema | done |
-| 0.1 | In-memory inverted index (the brute-force oracle) | next |
-| 0.2 | Serialize and round-trip a segment to a file | |
+| 0.1 | In-memory inverted index (the brute-force oracle) | done |
+| 0.2 | Serialize and round-trip a segment to a file | next |
 | 0.3 | Real 5-section layout, read only via byte ranges | |
 | 0.4 | Read counter: requests and bytes per query | |
 | 0.5 | Delta encoding and varint compression | |
@@ -68,6 +68,25 @@ scanned tests/fixtures/rees46_sample.csv
     remove_from_cart              1    3.7%
 ```
 
+Search it:
+
+```
+uv run python -m aether.index.search tests/fixtures/rees46_sample.csv "samsung smartphone"
+```
+
+```
+index: 27 docs, 40 terms, 185 postings   built in 0.5 ms
+       8.4 terms per document on average
+
+query "samsung smartphone"  ->  ['samsung', 'smartphone']
+    samsung              df      4
+    smartphone           df      9
+    AND                       4 docs in 0.008 ms
+
+  doc      1  Samsung White Lite Smartphone L486    view          electronics.smartphone   $130.76
+  ...
+```
+
 To work with real data, see [docs/DATA.md](docs/DATA.md).
 
 ## Layout
@@ -75,10 +94,14 @@ To work with real data, see [docs/DATA.md](docs/DATA.md).
 ```
 src/aether/
 ├── events.py          canonical event schema, the boundary everything targets
-└── data/
-    ├── rees46.py      streaming CSV -> canonical events (.csv and .csv.gz)
-    ├── titles.py      deterministic product titles derived from product_id
-    └── slice.py       carve a whole-session slice out of the full file
+├── data/
+│   ├── rees46.py      streaming CSV -> canonical events (.csv and .csv.gz)
+│   ├── titles.py      deterministic product titles derived from product_id
+│   └── slice.py       carve a whole-session slice out of the full file
+└── index/
+    ├── analyzer.py    text -> index terms
+    ├── memory.py      in-memory inverted index, the correctness oracle
+    └── search.py      build an index and query it from the command line
 tests/
 ├── fixtures/          small REES46-schema CSV, committed, all edge cases
 └── test_*.py
