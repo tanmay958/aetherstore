@@ -125,6 +125,15 @@ class SearchableIndex(ABC):
         posting_list = self.postings(term)
         return posting_list.df if posting_list else 0
 
+    def contains(self, term: str) -> bool:
+        """Whether a term appears at all, without fetching its posting list.
+
+        The default is honest but wasteful. A segment overrides it to answer
+        from a bloom filter and a dictionary block, both far cheaper than the
+        postings themselves.
+        """
+        return self.postings(term) is not None
+
     def documents(self, doc_ids: Iterable[int]) -> list[dict]:
         return [self.document(doc_id) for doc_id in doc_ids]
 
@@ -138,8 +147,18 @@ class SearchableIndex(ABC):
         fetching the rest, because one absent term collapses a conjunction and
         the remaining reads would buy nothing.
         """
+        terms = sorted(set(tokenize(query)))
+
+        # For a conjunction, establish that every term is present before
+        # fetching any postings. Otherwise a query for one common and one
+        # absent term pays to download the common term's posting list, then
+        # discards it on discovering the conjunction is empty. Presence is
+        # cheap to check and postings are not.
+        if require_all and not all(self.contains(term) for term in terms):
+            return [], False
+
         lists: list[tuple[str, PostingList]] = []
-        for term in sorted(set(tokenize(query))):
+        for term in terms:
             posting_list = self.postings(term)
             if posting_list is None:
                 if require_all:

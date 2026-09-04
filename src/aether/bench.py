@@ -149,6 +149,32 @@ def main(argv: list[str] | None = None) -> int:
         print(f"  {label:<22} {result.total:>10,} {counting.stats.requests:>9,} "
               f"{human(counting.stats.bytes_read):>10} {elapsed:>7,.0f}")
 
+    # -- cold queries ------------------------------------------------------
+
+    # Warm numbers hide what the bloom filter is for: with every dictionary
+    # block already cached it never has to answer anything. Cold is the state
+    # a freshly started process is in, and the one a serverless deployment is
+    # always in.
+    print(f"\nCOLD QUERIES   (segments open, dictionaries empty)")
+    print(f"  {'query':<22} {'hits':>10} {'requests':>9} {'no bloom':>9} {'saved':>7} {'ms':>7}")
+    for label, query, options in QUERIES:
+        fresh = CountingStore(store)
+        cold = Coordinator(fresh, max_workers=16)
+        for meta in cold.manifest.segments:
+            cold.reader(meta.key)
+        fresh.reset()
+        began = time.perf_counter()
+        result = cold.search(query, top_k=10, **options)
+        elapsed = (time.perf_counter() - began) * 1000
+
+        # Every bloom rejection is a dictionary read that did not happen, so
+        # the counterfactual is the requests made plus the rejections.
+        skipped = sum(reader.bloom_rejections for reader in cold._readers.values())
+        without = fresh.stats.requests + skipped
+        saved = f"{100 * skipped / without:.0f}%" if without else "-"
+        print(f"  {label:<22} {result.total:>10,} {fresh.stats.requests:>9,} "
+              f"{without:>9,} {saved:>7} {elapsed:>7,.0f}")
+
     # -- pruning -----------------------------------------------------------
 
     latest = max(meta.max_ts for meta in manifest.segments)

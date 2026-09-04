@@ -10,7 +10,7 @@ Layout, in the order the writer produces it:
     [POSTINGS]   per-term doc id and frequency runs
     [DOCSTORE]   the original events, in blocks
     [TERMDICT]   sorted terms in blocks, each pointing into POSTINGS
-    [HOTCACHE]   sparse term index, docstore block index, document lengths
+    [HOTCACHE]   sparse term index, bloom filter, docstore index, doc lengths
     [FOOTER]     fixed size, at the very end
 
 The order is forced. Each section can only be written once the one before it
@@ -55,6 +55,7 @@ from pathlib import Path
 from typing import Iterable, Iterator
 
 from aether.index.base import SearchableIndex
+from aether.index.bloom import BloomFilter
 from aether.index.codec import (
     decode_varint,
     decode_varints,
@@ -68,7 +69,7 @@ from aether.storage.base import ObjectStore
 from aether.storage.local import LocalStore
 
 SEGMENT_MAGIC = b"ATHR"
-SEGMENT_VERSION = 3
+SEGMENT_VERSION = 4
 
 # Terms per dictionary block. Finding a term costs one request for the block
 # containing it, so a larger block means fetching more bytes you will discard
@@ -215,6 +216,7 @@ def _encode_hotcache(
     term_blocks: list[tuple[str, int, int]],
     doc_blocks: list[tuple[int, int, int]],
     doc_lengths: list[int],
+    bloom: BloomFilter,
 ) -> bytes:
     """Everything needed to plan a query without touching the network again.
 
@@ -228,6 +230,11 @@ def _encode_hotcache(
     and a query can produce thousands of candidates. Fetching them from the
     docstore would defeat the point of having a docstore. Real engines squeeze
     these to a byte each; these are full integers for now.
+
+    The bloom filter is here for the same reason and pays off harder. Without
+    it, a term absent from a segment still costs a dictionary read to discover
+    that, and a query for a rare term pays that once per segment. With it, the
+    answer is already in memory.
     """
     out = bytearray(struct.pack("<I", len(term_blocks)))
     for first_term, offset, length in term_blocks:
@@ -241,12 +248,15 @@ def _encode_hotcache(
         out += struct.pack("<IQI", first_doc_id, offset, length)
 
     out += struct.pack(f"<I{len(doc_lengths)}I", len(doc_lengths), *doc_lengths)
+    out += bloom.to_bytes()
     return bytes(out)
 
 
 def _decode_hotcache(
     data: bytes,
-) -> tuple[list[tuple[str, int, int]], list[tuple[int, int, int]], list[int]]:
+) -> tuple[
+    list[tuple[str, int, int]], list[tuple[int, int, int]], list[int], BloomFilter
+]:
     (term_block_count,) = struct.unpack_from("<I", data)
     pos = 4
     term_blocks = []
@@ -270,7 +280,10 @@ def _decode_hotcache(
     (doc_count,) = struct.unpack_from("<I", data, pos)
     pos += 4
     doc_lengths = list(struct.unpack_from(f"<{doc_count}I", data, pos))
-    return term_blocks, doc_blocks, doc_lengths
+    pos += 4 * doc_count
+
+    bloom, _ = BloomFilter.from_bytes(data, pos)
+    return term_blocks, doc_blocks, doc_lengths, bloom
 
 
 # --------------------------------------------------------------------------
@@ -332,7 +345,9 @@ def write_segment(index: SearchableIndex) -> bytes:
     # 4. Hotcache, which needs the dictionary's offsets.
     hotcache_offset = len(out)
     doc_lengths = [index.doc_length(i) for i in range(index.num_docs)]
-    out += _encode_hotcache(term_blocks, doc_blocks, doc_lengths)
+    out += _encode_hotcache(
+        term_blocks, doc_blocks, doc_lengths, BloomFilter.for_terms(sorted_terms)
+    )
     hotcache_length = len(out) - hotcache_offset
 
     # 5. Footer, which needs all of the above.
@@ -401,7 +416,12 @@ class SegmentReader(SearchableIndex):
         self.footer = Footer.unpack(store.get_suffix(key, FOOTER_SIZE))
 
         # Request 2: the hotcache, located by the footer.
-        self._term_blocks, self._doc_blocks, self._doc_lengths = _decode_hotcache(
+        (
+            self._term_blocks,
+            self._doc_blocks,
+            self._doc_lengths,
+            self._bloom,
+        ) = _decode_hotcache(
             store.get_range(key, self.footer.hotcache_offset, self.footer.hotcache_length)
         )
         self._first_terms = [block[0] for block in self._term_blocks]
@@ -409,6 +429,11 @@ class SegmentReader(SearchableIndex):
 
         self._dict_cache: dict[int, dict[str, tuple[int, int, int]]] = {}
         self._doc_cache: dict[int, list[dict]] = {}
+        # How many lookups the bloom filter answered outright. Each one is a
+        # dictionary read that did not happen, which is the only way to see
+        # what the filter is worth: it shows up as requests absent from the
+        # counter rather than as anything present in it.
+        self.bloom_rejections = 0
 
     @classmethod
     def open(cls, path: Path | str) -> SegmentReader:
@@ -430,11 +455,20 @@ class SegmentReader(SearchableIndex):
     def _entry(self, term: str) -> tuple[int, int, int] | None:
         """Find a term's (df, postings offset, postings length).
 
-        The hotcache holds the first term of every dictionary block, so the
-        right block is found by binary search in memory. Doing that search
-        over the network instead would cost a round trip per probe, which is
-        the naive design this format exists to avoid.
+        Three levels, all but the last resolved in memory. The bloom filter
+        rules the term out entirely, or the sparse index in the hotcache names
+        the one dictionary block that could hold it. Binary searching the
+        dictionary over the network instead would cost a round trip per probe,
+        which is the naive design this format exists to avoid.
         """
+        # The bloom filter answers from memory. A "definitely not" ends the
+        # lookup here, which is the difference between one request per segment
+        # and none at all when a term is absent, and rare terms are the common
+        # case in real query logs.
+        if term not in self._bloom:
+            self.bloom_rejections += 1
+            return None
+
         block_index = bisect_right(self._first_terms, term) - 1
         if block_index < 0:
             return None
@@ -457,6 +491,15 @@ class SegmentReader(SearchableIndex):
             return None
         _, offset, length = entry
         return _decode_postings(self._store.get_range(self._key, offset, length))
+
+    def contains(self, term: str) -> bool:
+        """Presence without touching the postings.
+
+        A bloom miss answers from memory for no requests at all; otherwise it
+        costs the one dictionary block that could hold the term, which
+        scoring would have had to read anyway.
+        """
+        return self._entry(term) is not None
 
     def df(self, term: str) -> int:
         """Document frequency without fetching the posting list.

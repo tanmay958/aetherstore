@@ -43,12 +43,17 @@ numbers. One wave of requests, and rankings that are slightly inconsistent
 between segments. Elasticsearch defaults to exactly this.
 
 `global_stats=True` collects document frequencies from every segment first,
-then scores everything against the same denominator. Correct, and it costs no
-extra *requests*: document frequency comes from the term dictionary, which has
-to be read anyway, and the dictionary blocks are cached before the second pass
-touches them. What it costs is a second round trip in sequence, so at 200
-milliseconds a wave the query takes twice as long. Elasticsearch calls this
-`dfs_query_then_fetch`.
+then scores everything against the same denominator. Correct, and the cost is
+chiefly a second round trip in sequence, so at 200 milliseconds a wave the
+query takes twice as long. Elasticsearch calls this `dfs_query_then_fetch`.
+
+It adds no *postings* reads, because document frequency comes from the term
+dictionary, which scoring has to read anyway, and those blocks are cached
+before the second pass touches them. It can add dictionary reads, in segments
+where some query terms appear and others do not: a conjunction skips such a
+segment entirely, but a corpus-wide document frequency still has to count the
+documents in it. Paying to look at segments that will never contribute a
+result is inherent to the correct answer, not an implementation detail.
 """
 
 from __future__ import annotations
@@ -199,11 +204,13 @@ class Coordinator:
     def _gather_corpus_stats(
         self, segments: list[SegmentMeta], query: str
     ) -> CorpusStats:
-        """Collection-wide document frequencies, one wave of requests.
+        """Collection-wide document frequencies, in one wave of requests.
 
-        Costs no more requests than scoring would have anyway: document
-        frequency lives in the term dictionary, and the blocks read here are
-        cached before the scoring pass asks for postings from them.
+        Adds no postings fetches: document frequency lives in the term
+        dictionary, and the blocks read here are cached before the scoring
+        pass asks for postings from them. It can add dictionary reads in
+        segments the query will not match, because a corpus-wide frequency
+        must count documents that never appear in a result.
         """
         terms = sorted(set(tokenize(query)))
 

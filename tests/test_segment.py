@@ -382,3 +382,47 @@ def test_document_lengths_come_from_the_hotcache_not_the_docstore(store, segment
     for doc_id in range(segment.num_docs):
         segment.doc_length(doc_id)
     assert store.stats.requests == 0
+
+
+# --------------------------------------------------------------------------
+# the bloom filter
+# --------------------------------------------------------------------------
+
+
+def test_an_absent_term_costs_no_requests_at_all(store, segment):
+    """What the filter is for. Without it, discovering a term is missing costs
+    one dictionary read per segment, and a query across a hundred segments
+    pays that a hundred times to learn nothing."""
+    store.reset()
+    assert segment.postings("zzzznotpresenthere") is None
+    assert store.stats.requests == 0
+
+
+def test_presence_is_cheaper_than_fetching_postings(store):
+    """Confirming a term that *is* present still costs its dictionary block;
+    only an absent one is free. What presence avoids is the postings fetch."""
+    checking = SegmentReader(store, "s.seg")
+    store.reset()
+    assert checking.contains("samsung") is True
+    presence = store.stats.requests
+
+    fetching = SegmentReader(store, "s.seg")
+    store.reset()
+    fetching.postings("samsung")
+    assert presence < store.stats.requests
+
+
+def test_a_doomed_conjunction_fetches_no_postings(store, segment):
+    """One absent term makes the whole conjunction empty, so downloading the
+    other term's posting list first would be pure waste."""
+    segment.contains("samsung")  # warm the dictionary block
+    store.reset()
+    assert segment.search_and("samsung zzzznotpresenthere") == []
+    assert store.stats.requests == 0
+
+
+def test_the_filter_never_hides_a_real_term(index, segment):
+    """A false maybe costs a wasted read. A false no would silently drop
+    matching documents and look like bad relevance rather than a bug."""
+    for term in index.terms():
+        assert segment.contains(term), term

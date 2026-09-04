@@ -24,6 +24,7 @@ on Cloudflare R2.
 | 1.0 | Manifest, multi-segment fan-out, time pruning | done |
 | 1.1 | Kafka indexer: idempotent flush, crash recovery | done |
 | 1.2 | Benchmarked on 1M real REES46 events | done |
+| 1.3 | Bloom filter per segment | done |
 
 Later phases add the bloom filter and skip lists, Kafka and the indexer service, the multi-segment query coordinator, compaction, the ML pipeline, and a dashboard.
 Infrastructure comes last on purpose: the segment format needs none of it, and everything downstream is a caller of it.
@@ -69,11 +70,20 @@ only reason the earlier numbers were worth quoting at all.
 line: a small immutable summary, fetched once and cached forever because a
 segment can never change, standing in for the rest of the index.
 
-And the honest one: an absent term costs zero requests *warm*, but 100
-dictionary reads cold, one per segment, to learn it is not there. A bloom
-filter in the already-cached hotcache would answer that for free. That
-optimization was unmeasurable on 27 documents and is obvious now, which is
-why it was not built earlier.
+A cold process is the state that matters for a serverless deployment, and it
+is where the bloom filter earns its 0.5 MB:
+
+```
+COLD QUERIES                 hits  requests  no bloom   saved
+  common, two terms        89,707       399       399      0%
+  rare brand                   43        56       128     56%
+  absent term                   0         1       100     99%
+```
+
+Zero for common terms, because every segment genuinely holds them. The filter
+can only help when the answer is no, and the single remaining request on an
+absent term is the predicted 1% false positive landing on exactly one of a
+hundred segments.
 
 ## Design
 
@@ -255,10 +265,13 @@ differently depending on which segment they landed in:
 ```
 
 `--global-stats` collects document frequencies from every segment first, so all
-of them score against the same denominator. It costs no extra *requests* --
-document frequency lives in the term dictionary, which scoring reads anyway --
-only a second wave of them in sequence. Elasticsearch makes the same trade under
-the name `dfs_query_then_fetch`, and defaults to local for the same reason.
+of them score against the same denominator. The cost is chiefly a second wave
+of requests in sequence rather than more of them: document frequency lives in
+the term dictionary, which scoring reads anyway. It does add a few dictionary
+reads, in segments where one query term appears and another does not -- a
+conjunction skips such a segment, but a corpus-wide frequency still has to
+count the documents in it. Elasticsearch makes the same trade under the name
+`dfs_query_then_fetch`, and defaults to local for the same reason.
 
 The score gap above is length normalization at work -- `add_to_cart` tokenizes
 into more terms than `view`, making those documents longer and therefore
@@ -298,6 +311,7 @@ src/aether/
     ├── base.py        the read interface every backend satisfies
     ├── memory.py      in-memory inverted index, the correctness oracle
     ├── codec.py       delta encoding and varints for posting lists
+    ├── bloom.py       per-segment term filter, rides in the hotcache
     ├── scorer.py      BM25 relevance scoring
     ├── manifest.py    which segments are live: the commit point
     ├── coordinator.py fan out across segments, prune, merge

@@ -101,11 +101,18 @@ def test_local_stats_do_shift_scores_between_segments(sharded, whole):
     assert local != unified
 
 
-def test_global_stats_costs_a_second_wave_not_more_requests(sharded):
-    """Document frequency comes from the term dictionary, which scoring has to
-    read anyway, and those blocks are cached before the second pass. The price
-    is latency, not requests."""
+def test_global_stats_costs_a_second_wave(sharded):
+    """The price is chiefly latency, not requests.
+
+    No postings fetches are added: document frequency lives in the term
+    dictionary, which scoring reads anyway, and those blocks are cached before
+    the second pass. A few dictionary reads can be added, in segments where
+    some query terms appear and others do not. A conjunction skips such a
+    segment, but a corpus-wide document frequency still has to count the
+    documents in it, so paying to look is inherent to the correct answer.
+    """
     query = "samsung smartphone"
+    terms = 2
     sharded.search(query, top_k=10)  # warm the dictionary blocks
 
     sharded.store.reset()
@@ -114,8 +121,13 @@ def test_global_stats_costs_a_second_wave_not_more_requests(sharded):
 
     sharded.store.reset()
     two_waves = sharded.search(query, top_k=10, global_stats=True)
+
     assert two_waves.stats.waves == 2
-    assert sharded.store.stats.requests == one_wave
+    # Bounded by one dictionary block per term per segment, and nowhere near
+    # the doubling that re-fetching postings would cost.
+    assert one_wave <= sharded.store.stats.requests <= one_wave + terms * len(
+        sharded.manifest.segments
+    )
 
 
 # --------------------------------------------------------------------------
