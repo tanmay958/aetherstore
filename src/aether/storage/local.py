@@ -48,6 +48,9 @@ class LocalStore(ObjectStore):
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(data)
 
+    def delete(self, key: str) -> None:
+        self._path(key).unlink(missing_ok=True)
+
     def size(self, key: str) -> int:
         return self._path(key).stat().st_size
 

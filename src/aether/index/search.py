@@ -11,8 +11,9 @@ the engine enormously. The request count is the number that carries over to
 object storage unchanged, where each one is a 20-50ms round trip that costs
 money regardless of how many bytes it returns.
 
-    python -m aether.index.search tests/fixtures/rees46_sample.csv "samsung smartphone"
+    python -m aether.index.search events.csv "samsung smartphone"
     python -m aether.index.search out.seg "samsung smartphone"
+    python -m aether.index.search r2://aether/segments/0.seg "samsung smartphone"
 """
 
 from __future__ import annotations
@@ -26,15 +27,16 @@ from aether.index.analyzer import tokenize
 from aether.index.base import SearchableIndex
 from aether.index.memory import build_index
 from aether.index.segment import SegmentReader
-from aether.storage import CountingStore, LocalStore, ReadStats
+from aether.storage import CountingStore, LocalStore, ReadStats, open_object
 
 
-def load(path: Path) -> tuple[SearchableIndex, str, CountingStore | None]:
+def load(target: str) -> tuple[SearchableIndex, str, CountingStore | None, str]:
     """Open a segment through a counting store, or index a CSV in memory."""
-    if path.suffix == ".seg":
-        store = CountingStore(LocalStore(path.parent))
-        return SegmentReader(store, path.name), "segment", store
-    return build_index(iter_events(path)), "memory index", None
+    if target.endswith(".seg"):
+        inner, key = open_object(target)
+        store = CountingStore(inner)
+        return SegmentReader(store, key), "segment", store, key
+    return build_index(iter_events(Path(target))), "memory index", None, ""
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -42,7 +44,9 @@ def main(argv: list[str] | None = None) -> int:
         prog="aether.index.search",
         description="Build or open an index and query it.",
     )
-    parser.add_argument("input", type=Path, help="REES46 .csv/.csv.gz or a .seg")
+    parser.add_argument(
+        "input", help="a REES46 .csv/.csv.gz, or a .seg path or s3://|r2:// URI"
+    )
     parser.add_argument("query", help="search terms")
     parser.add_argument(
         "--or", dest="use_or", action="store_true", help="match any term instead of all"
@@ -50,11 +54,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--top", type=int, default=10, help="results to display")
     args = parser.parse_args(argv)
 
-    if not args.input.exists():
+    if "://" not in args.input and not Path(args.input).exists():
         parser.error(f"{args.input} not found. See docs/DATA.md for how to get it.")
 
     started = time.perf_counter()
-    index, kind, store = load(args.input)
+    index, kind, store, key = load(args.input)
     open_ms = (time.perf_counter() - started) * 1000
     # A snapshot, not the live object: store.stats keeps accumulating.
     open_cost = ReadStats(store.stats.requests, store.stats.bytes_read) if store else None
@@ -118,7 +122,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"    term lookup      {lookup_cost}")
         print(f"    posting lists    {match_cost}")
         print(f"    fetch {len(shown):>2} docs     {fetch_cost}")
-        print(f"    segment on disk  {store.size(args.input.name):,} B")
+        print(f"    segment size     {store.size(key):,} B")
     return 0
 
 

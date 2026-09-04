@@ -107,6 +107,9 @@ class CountingStore(ObjectStore):
     def put(self, key: str, data: bytes) -> None:
         self.inner.put(key, data)
 
+    def delete(self, key: str) -> None:
+        self.inner.delete(key)
+
     def size(self, key: str) -> int:
         return self.inner.size(key)
 

@@ -2,6 +2,14 @@
 
 from aether.storage.base import ObjectStore
 from aether.storage.counting import CountingStore, ReadStats
+from aether.storage.factory import open_object, open_store
 from aether.storage.local import LocalStore
 
-__all__ = ["ObjectStore", "LocalStore", "CountingStore", "ReadStats"]
+__all__ = [
+    "ObjectStore",
+    "LocalStore",
+    "CountingStore",
+    "ReadStats",
+    "open_store",
+    "open_object",
+]

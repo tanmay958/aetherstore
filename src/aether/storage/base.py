@@ -59,4 +59,15 @@ class ObjectStore(ABC):
         """Length of an object in bytes."""
 
     @abstractmethod
+    def delete(self, key: str) -> None:
+        """Remove an object. Deleting something absent is not an error.
+
+        Segments are immutable, but they are not eternal: compaction merges
+        several into one and then removes the originals, and a garbage
+        collector eventually removes objects no manifest references. Both need
+        this, and both must tolerate the object already being gone, because a
+        retried delete is the normal case rather than the exception.
+        """
+
+    @abstractmethod
     def exists(self, key: str) -> bool: ...

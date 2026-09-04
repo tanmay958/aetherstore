@@ -8,7 +8,7 @@ Not a wrapper around Elasticsearch. The segment format, the postings codec, the 
 
 ## Status
 
-Phase 0, step 6 of 8: **BM25 ranking**.
+**Phase 0 complete.** The storage engine works end to end, locally and on object storage.
 
 | Step | | |
 |---|---|---|
@@ -19,7 +19,7 @@ Phase 0, step 6 of 8: **BM25 ranking**.
 | 0.4 | Read counter: requests and bytes per query | done |
 | 0.5 | Delta encoding and varint compression | done |
 | 0.6 | BM25 scoring | done |
-| 0.7 | `S3Store` against MinIO, one config line | next |
+| 0.7 | `S3Store` against MinIO, R2 and S3 | done |
 
 Later phases add the bloom filter and skip lists, Kafka and the indexer service, the multi-segment query coordinator, compaction, the ML pipeline, and a dashboard.
 Infrastructure comes last on purpose: the segment format needs none of it, and everything downstream is a caller of it.
@@ -139,7 +139,17 @@ The score gap above is length normalization at work -- `add_to_cart` tokenizes
 into more terms than `view`, making those documents longer and therefore
 slightly less relevant per match.
 
+The same commands work against object storage, which is what `ObjectStore` was
+defined for in step 3. Nothing above that layer changed to make this work:
+
+```
+uv run python -m aether.storage.check     r2://aether
+uv run python -m aether.index.build       events.csv r2://aether/segments/0.seg
+uv run python -m aether.index.search      r2://aether/segments/0.seg "samsung smartphone"
+```
+
 To work with real data, see [docs/DATA.md](docs/DATA.md).
+For MinIO, R2, and S3 setup, see [docs/STORAGE.md](docs/STORAGE.md).
 
 ## Layout
 
@@ -153,7 +163,10 @@ src/aether/
 ├── storage/
 │   ├── base.py        ObjectStore: get_range, get_suffix, put
 │   ├── local.py       filesystem-backed, stands in for S3/R2
-│   └── counting.py    request and byte accounting
+│   ├── s3.py          AWS S3, Cloudflare R2, MinIO: one implementation
+│   ├── counting.py    request and byte accounting
+│   ├── factory.py     open_store / open_object from a URI
+│   └── check.py       verify a backend before trusting an index to it
 └── index/
     ├── analyzer.py    text -> index terms
     ├── postings.py    posting lists, intersect and union merge walks

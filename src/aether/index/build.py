@@ -1,6 +1,8 @@
 """Build a segment file from a REES46 CSV.
 
-    python -m aether.index.build tests/fixtures/rees46_sample.csv out.seg
+    python -m aether.index.build events.csv out.seg
+    python -m aether.index.build events.csv s3://aether/segments/0.seg
+    python -m aether.index.build events.csv r2://aether/segments/0.seg
 """
 
 from __future__ import annotations
@@ -11,7 +13,8 @@ from pathlib import Path
 
 from aether.data.rees46 import iter_events
 from aether.index.memory import build_index
-from aether.index.segment import FOOTER_SIZE, SegmentReader, write_segment_file
+from aether.index.segment import FOOTER_SIZE, SegmentReader, write_segment
+from aether.storage import open_object
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -20,7 +23,9 @@ def main(argv: list[str] | None = None) -> int:
         description="Index a REES46 CSV into a segment file.",
     )
     parser.add_argument("input", type=Path, help="REES46 .csv or .csv.gz")
-    parser.add_argument("output", type=Path, help="segment file to write")
+    parser.add_argument(
+        "output", help="where to write: a path, s3://bucket/key, or r2://bucket/key"
+    )
     parser.add_argument("--limit", type=int, default=None, help="index at most N events")
     args = parser.parse_args(argv)
 
@@ -31,12 +36,18 @@ def main(argv: list[str] | None = None) -> int:
     index = build_index(iter_events(args.input, limit=args.limit))
     build_ms = (time.perf_counter() - started) * 1000
 
+    # The same call whether this lands on disk, in MinIO, in R2, or in S3.
+    # That is the whole return on defining ObjectStore back in step 3.
+    store, key = open_object(args.output)
+    data = write_segment(index)
+
     started = time.perf_counter()
-    written = write_segment_file(index, args.output)
+    store.put(key, data)
     write_ms = (time.perf_counter() - started) * 1000
+    written = len(data)
 
     raw = args.input.stat().st_size
-    footer = SegmentReader.open(args.output).footer
+    footer = SegmentReader(store, key).footer
 
     print(f"wrote {args.output}")
     print(f"  documents      {index.num_docs:,}")
@@ -44,7 +55,7 @@ def main(argv: list[str] | None = None) -> int:
     print(f"  postings       {index.num_postings:,}")
     print(f"  avg doc length {index.avg_doc_length:.1f} terms")
     print(f"  indexed in     {build_ms:,.1f} ms")
-    print(f"  written in     {write_ms:,.1f} ms")
+    print(f"  uploaded in    {write_ms:,.1f} ms")
     print()
     print(f"  segment size   {written:,} B")
     for name, size in (
