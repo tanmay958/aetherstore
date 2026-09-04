@@ -154,6 +154,78 @@ def test_case_is_ignored(backend):
 
 
 # --------------------------------------------------------------------------
+# ranking
+# --------------------------------------------------------------------------
+
+
+def test_ranked_search_returns_the_same_documents_as_matching(backend):
+    """Scoring changes the order, never the membership."""
+    result = backend.search("samsung smartphone", top_k=100)
+    assert sorted(hit.doc_id for hit in result.hits) == backend.search_and(
+        "samsung smartphone"
+    )
+
+
+def test_results_come_back_best_first(backend):
+    scores = [hit.score for hit in backend.search("electronics", top_k=20, mode="or")]
+    assert scores == sorted(scores, reverse=True)
+
+
+def test_total_counts_all_matches_not_just_the_page(backend):
+    """Returned rather than recomputed, because matching twice would fetch
+    every posting list twice."""
+    result = backend.search("electronics", top_k=2, mode="or")
+    assert len(result.hits) == 2
+    assert result.total == len(backend.search_or("electronics"))
+
+
+def test_top_k_limits_the_page(backend):
+    for k in (1, 3, 100):
+        assert len(backend.search("electronics", top_k=k, mode="or").hits) <= k
+
+
+def test_a_rarer_term_outranks_a_common_one(backend):
+    """The whole point of idf. "bosch" appears in a handful of documents,
+    "view" in most of them, so a bosch match should win."""
+    result = backend.search("bosch view", top_k=20, mode="or")
+    ranked = [hit.doc_id for hit in result.hits]
+    bosch_docs = set(backend.search_and("bosch"))
+    assert ranked[0] in bosch_docs
+
+
+def test_ties_break_by_document_id_so_results_are_stable(backend):
+    result = backend.search("samsung smartphone", top_k=10)
+    pairs = [(-hit.score, hit.doc_id) for hit in result.hits]
+    assert pairs == sorted(pairs)
+
+
+def test_scores_are_identical_across_backends(sample_csv, tmp_path, backend):
+    """A byte-range reader over compressed postings must produce exactly the
+    same floats as a plain dict, or ranking silently depends on storage."""
+    from aether.index.memory import build_index
+    from aether.data.rees46 import iter_events
+
+    reference = build_index(iter_events(sample_csv))
+    for query in ("samsung smartphone", "electronics", "bosch", "view purchase"):
+        expected = reference.search(query, top_k=20, mode="or")
+        actual = backend.search(query, top_k=20, mode="or")
+        assert [h.doc_id for h in actual.hits] == [h.doc_id for h in expected.hits]
+        assert [h.score for h in actual.hits] == [h.score for h in expected.hits]
+
+
+@pytest.mark.parametrize("query", ["", "the of and", "helicopter"])
+def test_unmatchable_queries_rank_nothing(backend, query):
+    result = backend.search(query)
+    assert result.hits == []
+    assert result.total == 0
+
+
+def test_rejects_an_unknown_mode(backend):
+    with pytest.raises(ValueError, match="mode must be"):
+        backend.search("samsung", mode="maybe")
+
+
+# --------------------------------------------------------------------------
 # the oracle
 # --------------------------------------------------------------------------
 

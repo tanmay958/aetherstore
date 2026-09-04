@@ -8,7 +8,7 @@ Not a wrapper around Elasticsearch. The segment format, the postings codec, the 
 
 ## Status
 
-Phase 0, step 5 of 8: **compression**.
+Phase 0, step 6 of 8: **BM25 ranking**.
 
 | Step | | |
 |---|---|---|
@@ -18,8 +18,8 @@ Phase 0, step 5 of 8: **compression**.
 | 0.3 | Real 5-section layout, read only via byte ranges | done |
 | 0.4 | Read counter: requests and bytes per query | done |
 | 0.5 | Delta encoding and varint compression | done |
-| 0.6 | BM25 scoring | next |
-| 0.7 | `S3Store` against MinIO, one config line | |
+| 0.6 | BM25 scoring | done |
+| 0.7 | `S3Store` against MinIO, one config line | next |
 
 Later phases add the bloom filter and skip lists, Kafka and the indexer service, the multi-segment query coordinator, compaction, the ML pipeline, and a dashboard.
 Infrastructure comes last on purpose: the segment format needs none of it, and everything downstream is a caller of it.
@@ -117,12 +117,27 @@ Searching reports what it cost in requests, because on object storage the round
 trip is the price, not the bytes:
 
 ```
+    score     doc  title
+    3.927       1  Samsung White Lite Smartphone L486   view
+    3.927       4  Samsung White Lite Smartphone L486   view
+    3.803       7  Samsung White Lite Smartphone L486   add_to_cart
+    3.803      13  Samsung White Lite Smartphone L486   remove_from_cart
+
   storage cost
     open (once)      2 requests, 290 B
     term lookup      1 request, 194 B
-    posting lists    2 requests, 112 B
-    fetch  4 docs     1 request, 1.0 KB
+    posting lists    2 requests, 28 B
+    fetch  4 docs     1 request, 966 B
 ```
+
+Ranking adds no requests: BM25 needs document frequency, which arrived with the
+dictionary block, term frequency, which arrived with the postings, and document
+length, which arrived with the hotcache. All three were recorded in earlier
+steps for this moment.
+
+The score gap above is length normalization at work -- `add_to_cart` tokenizes
+into more terms than `view`, making those documents longer and therefore
+slightly less relevant per match.
 
 To work with real data, see [docs/DATA.md](docs/DATA.md).
 
@@ -145,6 +160,7 @@ src/aether/
     ├── base.py        the read interface every backend satisfies
     ├── memory.py      in-memory inverted index, the correctness oracle
     ├── codec.py       delta encoding and varints for posting lists
+    ├── scorer.py      BM25 relevance scoring
     ├── segment.py     the 5-section binary format and its byte-range reader
     ├── build.py       CSV -> segment file
     └── search.py      query a CSV or a segment

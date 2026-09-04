@@ -83,32 +83,33 @@ def main(argv: list[str] | None = None) -> int:
         note = "  (not in index)" if df == 0 else ""
         print(f"    {term:<20} df {df:>6,}{note}")
 
+    mode = "or" if args.use_or else "and"
     with noop.measure() as match_cost:
         started = time.perf_counter()
-        hits = index.search_or(args.query) if args.use_or else index.search_and(args.query)
+        result = index.search(args.query, top_k=args.top, mode=mode)
         query_ms = (time.perf_counter() - started) * 1000
 
-    mode = "OR " if args.use_or else "AND"
-    print(f"    {mode:<20} {len(hits):>6,} docs in {query_ms:.3f} ms")
+    label = "OR " if args.use_or else "AND"
+    print(f"    {label:<20} {result.total:>6,} docs in {query_ms:.3f} ms")
     print()
 
-    if not hits:
+    if not result.hits:
         print("  no matches")
         return 0
 
     with noop.measure() as fetch_cost:
-        shown = [(doc_id, index.document(doc_id)) for doc_id in hits[: args.top]]
+        shown = [(hit, index.document(hit.doc_id)) for hit in result.hits]
 
-    # Ordered by document id, not relevance: ranking arrives with BM25.
-    for doc_id, doc in shown:
+    print(f"  {'score':>7}  {'doc':>6}  title")
+    for hit, doc in shown:
         title = doc["title"] or "(no title)"
         price = f"${doc['price']:,.2f}" if doc["price"] is not None else ""
         print(
-            f"  doc {doc_id:>6}  {title:<42} {doc['event_type']:<16} "
-            f"{doc['category'] or '':<34} {price:>10}"
+            f"  {hit.score:>7.3f}  {hit.doc_id:>6}  {title:<42} "
+            f"{doc['event_type']:<16} {doc['category'] or '':<28} {price:>10}"
         )
-    if len(hits) > args.top:
-        print(f"  ... and {len(hits) - args.top:,} more")
+    if result.total > len(result.hits):
+        print(f"  ... and {result.total - len(result.hits):,} more")
 
     if store is not None:
         print()

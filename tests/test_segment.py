@@ -352,3 +352,33 @@ def test_the_reader_never_fetches_the_whole_file(store):
     segment = SegmentReader(store, "s.seg")
     segment.search_and("samsung smartphone")
     assert store.stats.bytes_read < store.size("s.seg")
+
+
+def test_ranking_costs_no_extra_requests(store, segment):
+    """Every input BM25 needs was recorded in an earlier step for this moment:
+    df arrives with the dictionary block, tf with the postings, and document
+    lengths with the hotcache. Scoring therefore reads nothing that matching
+    did not already have to read."""
+    # Warm the dictionary blocks first, so both measurements start from the
+    # same cache state. Comparing a cold call against a warm one would show
+    # ranking as cheaper than matching, which is true but not the claim.
+    segment.search_and("samsung smartphone")
+
+    store.reset()
+    matched = segment.search_and("samsung smartphone")
+    match_requests = store.stats.requests
+
+    store.reset()
+    ranked = segment.search("samsung smartphone", top_k=10)
+
+    assert store.stats.requests == match_requests
+    assert sorted(hit.doc_id for hit in ranked.hits) == matched
+
+
+def test_document_lengths_come_from_the_hotcache_not_the_docstore(store, segment):
+    """BM25 needs one length per candidate and a query can produce thousands.
+    Fetching them from the docstore would defeat having a docstore."""
+    store.reset()
+    for doc_id in range(segment.num_docs):
+        segment.doc_length(doc_id)
+    assert store.stats.requests == 0
