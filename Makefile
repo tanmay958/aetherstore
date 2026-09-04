@@ -11,13 +11,20 @@ test:
 
 up:
 	docker compose up -d --wait
-	@echo "MinIO on http://localhost:9000, console on http://localhost:9001"
+	@echo "MinIO      http://localhost:9000   console http://localhost:9001"
+	@echo "Redpanda   localhost:19092         console http://localhost:8080"
 
 down:
 	docker compose down
 
 logs:
-	docker compose logs -f minio
+	docker compose logs -f
+
+topic:
+	docker compose exec redpanda rpk topic describe clickstream --brokers redpanda:9092
+
+lag:
+	docker compose exec redpanda rpk group describe aether-indexers --brokers redpanda:9092
 
 bench:
 	uv run python -m aether.index.build tests/fixtures/rees46_sample.csv data/fixture.seg

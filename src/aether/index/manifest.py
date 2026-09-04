@@ -55,6 +55,24 @@ class SegmentMeta:
     bytes: int
     min_ts: int
     max_ts: int
+    # The source range this segment covers: Kafka offsets for the streaming
+    # indexer, row numbers for batch ingest. Recorded so that republishing a
+    # range can evict whatever previously covered it. Optional because a
+    # segment produced some other way may have no natural range.
+    first_offset: int | None = None
+    last_offset: int | None = None
+
+    def covers(self, first: int, last: int) -> bool:
+        """Whether this segment's source range intersects [first, last].
+
+        Two segments covering overlapping ranges hold some of the same
+        documents, and an index listing both counts those documents twice.
+        BM25 then scores against inflated frequencies and the relevance is
+        quietly wrong, with nothing anywhere reporting an error.
+        """
+        if self.first_offset is None or self.last_offset is None:
+            return False
+        return self.first_offset <= last and first <= self.last_offset
 
     def overlaps(self, start: int | None, end: int | None) -> bool:
         """Whether this segment could hold anything in a time window.
@@ -84,6 +102,30 @@ class Manifest:
     @property
     def bytes(self) -> int:
         return sum(segment.bytes for segment in self.segments)
+
+    def publish(self, segment: SegmentMeta) -> Manifest:
+        """Add a segment, evicting anything it supersedes.
+
+        A replay can produce a segment covering a wider range than the one it
+        is redoing: an interrupted flush may have sealed offsets 100 to 101,
+        while the replay reaches 100 to 104 before flushing. Appending both
+        would list offsets 100 and 101 twice.
+
+        Evicting by range rather than by key is what makes that safe. The
+        superseded object stays in storage, unreferenced and invisible, until
+        a collector removes it, which is the cost of a non-deterministic flush
+        boundary and the reason count-based flushing is the default.
+        """
+        kept = [
+            existing
+            for existing in self.segments
+            if existing.key != segment.key
+            and not (
+                segment.first_offset is not None
+                and existing.covers(segment.first_offset, segment.last_offset)
+            )
+        ]
+        return self.with_segments([*kept, segment])
 
     def with_segments(self, segments: Iterable[SegmentMeta]) -> Manifest:
         """A new manifest naming a different set, one generation later.

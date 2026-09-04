@@ -9,6 +9,9 @@ dependencies = []
 # Needed only to talk to S3-compatible storage. The engine itself has no
 # runtime dependencies, and every test that does not touch S3 runs without it.
 s3 = ["boto3>=1.34"]
+stream = [
+    "confluent-kafka>=2.5",
+]
 
 [dependency-groups]
 dev = ["pytest>=8.0", "boto3>=1.34"]

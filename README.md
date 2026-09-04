@@ -22,6 +22,7 @@ on Cloudflare R2.
 | 0.6 | BM25 scoring | done |
 | 0.7 | `S3Store` against MinIO, R2 and S3 | done |
 | 1.0 | Manifest, multi-segment fan-out, time pruning | done |
+| 1.1 | Kafka indexer: idempotent flush, crash recovery | done |
 
 Later phases add the bloom filter and skip lists, Kafka and the indexer service, the multi-segment query coordinator, compaction, the ML pipeline, and a dashboard.
 Infrastructure comes last on purpose: the segment format needs none of it, and everything downstream is a caller of it.
@@ -160,6 +161,39 @@ Same cost in requests and money, 3.1x the speed. Time pruning is cheaper still:
 the manifest carries each segment's time span, so a query outside it discards
 whole segments for **zero** requests.
 
+### Streaming
+
+```
+make up                                                    # Redpanda + MinIO
+uv run python -m aether.stream.producer events.csv         # CSV -> Kafka
+uv run python -m aether.stream.indexer r2://aether         # Kafka -> segments
+```
+
+The indexer's whole correctness argument is the order of five steps:
+
+```
+1. consume offsets 100..199
+2. build the index in memory
+3. PUT segments/p0/...100-199.seg
+4. PUT manifests/p0/current.json     <- searchable here
+5. commit offset 200                 <- acknowledged only now
+```
+
+Work first, bookmark last. Committing first would be at-most-once: a crash
+between the two loses the batch with nothing to detect it. This order is
+at-least-once, so a crash duplicates instead, and duplication is survivable
+because the segment key is derived from the offset range. A replay rewrites a
+byte-identical object at the same key, so the duplicate cannot exist.
+
+There is a test for a crash at every step, and one asserting that a replay of a
+*partially* flushed batch supersedes rather than duplicates it. None of them
+need a broker: offsets are just monotonic integers, which is why the indexing
+core knows nothing about Kafka.
+
+Single-writer safety is inherited rather than built. Kafka gives each partition
+to exactly one consumer in a group, so one manifest per partition means one
+writer per file, with no lock and no consensus algorithm.
+
 ### Scoring across segments
 
 BM25 asks how many documents are in the collection and how many contain the
@@ -220,6 +254,11 @@ src/aether/
     ├── manifest.py    which segments are live: the commit point
     ├── coordinator.py fan out across segments, prune, merge
     ├── ingest.py      CSV -> many segments + manifest
+└── stream/
+    ├── config.py      Kafka connection settings
+    ├── producer.py    CSV -> Kafka, keyed by session
+    ├── partition.py   the indexing core: offsets in, segments out
+    └── indexer.py     the consumer service
     ├── segment.py     the 5-section binary format and its byte-range reader
     ├── build.py       CSV -> segment file
     └── search.py      query a CSV or a segment

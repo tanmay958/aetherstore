@@ -71,7 +71,15 @@ def ingest(
         store.put(key, data)
 
         footer = SegmentReader(store, key).footer
-        meta = SegmentMeta(key, footer.num_docs, len(data), footer.min_ts, footer.max_ts)
+        meta = SegmentMeta(
+            key,
+            footer.num_docs,
+            len(data),
+            footer.min_ts,
+            footer.max_ts,
+            first_offset=first_doc,
+            last_offset=seen - 1,
+        )
         segments.append(meta)
         if on_flush:
             on_flush(meta)

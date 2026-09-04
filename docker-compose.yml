@@ -6,9 +6,10 @@
 # time was lost to container configuration before there was anything to run in
 # one.
 #
-#   make up      start MinIO and create the bucket
+#   make up      start everything
 #   make down    stop it
-#   console      http://localhost:9001   (aether / aethersecret)
+#   MinIO console     http://localhost:9001   (aether / aethersecret)
+#   Redpanda console  http://localhost:8080
 
 services:
   minio:
@@ -42,5 +43,62 @@ services:
       echo 'bucket ready: aether'
       "
 
+  # Redpanda: the Kafka wire protocol in one binary, no ZooKeeper, and around
+  # 500MB of RAM. Nothing in this project is Redpanda specific, so the same
+  # code runs against any Kafka cluster.
+  redpanda:
+    image: redpandadata/redpanda:latest
+    command:
+      - redpanda start
+      - --smp 1
+      - --memory 1G
+      - --overprovisioned
+      - --node-id 0
+      - --check=false
+      # Two listeners because the broker tells clients where to reach it, and
+      # the right answer differs inside the compose network from outside it.
+      # Getting this wrong is the single most common way a first Kafka setup
+      # fails, and it fails confusingly: connection succeeds, then every
+      # produce times out.
+      - --kafka-addr internal://0.0.0.0:9092,external://0.0.0.0:19092
+      - --advertise-kafka-addr internal://redpanda:9092,external://localhost:19092
+    ports:
+      - "19092:19092"   # Kafka API, from the host
+    volumes:
+      - redpanda-data:/var/lib/redpanda/data
+    healthcheck:
+      test: ["CMD-SHELL", "rpk cluster health | grep -q 'Healthy:.*true'"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+  # Creates the topic with several partitions once the broker is healthy.
+  # Partition count is the ceiling on indexer parallelism and cannot be raised
+  # later without rehashing every key and breaking session locality, so it is
+  # set generously from the start.
+  createtopic:
+    image: redpandadata/redpanda:latest
+    depends_on:
+      redpanda:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      rpk topic create clickstream --partitions 12 --replicas 1
+        --brokers redpanda:9092 || true;
+      echo 'topic ready: clickstream (12 partitions)'
+      "
+
+  # Web UI for the topic: messages, consumer groups, and lag.
+  console:
+    image: redpandadata/console:latest
+    depends_on:
+      redpanda:
+        condition: service_healthy
+    environment:
+      KAFKA_BROKERS: redpanda:9092
+    ports:
+      - "8080:8080"
+
 volumes:
   minio-data:
+  redpanda-data:

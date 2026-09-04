@@ -87,3 +87,57 @@ def test_time_overlap_decides_pruning(start, end, expected):
     """The cheapest optimization in the engine: whole segments discarded on
     arithmetic over data already in memory, for zero requests."""
     assert A.overlaps(start, end) is expected
+
+
+# --------------------------------------------------------------------------
+# publishing, and not duplicating
+# --------------------------------------------------------------------------
+
+
+def _ranged(key: str, first: int, last: int) -> SegmentMeta:
+    return SegmentMeta(key, last - first + 1, 100, 0, 0, first_offset=first, last_offset=last)
+
+
+def test_publish_appends_a_disjoint_segment():
+    manifest = Manifest().with_segments([_ranged("a.seg", 0, 9)])
+    published = manifest.publish(_ranged("b.seg", 10, 19))
+    assert [s.key for s in published.segments] == ["a.seg", "b.seg"]
+
+
+def test_publish_evicts_an_overlapping_range():
+    """A replay can seal a wider range than the attempt it redoes. Listing
+    both would index the overlapping documents twice, and BM25 would score
+    against inflated frequencies with nothing reporting an error."""
+    manifest = Manifest().with_segments([_ranged("narrow.seg", 100, 101)])
+    published = manifest.publish(_ranged("wide.seg", 100, 104))
+    assert [s.key for s in published.segments] == ["wide.seg"]
+    assert published.docs == 5
+
+
+def test_publish_replaces_a_same_keyed_segment():
+    manifest = Manifest().with_segments([_ranged("a.seg", 0, 9)])
+    published = manifest.publish(_ranged("a.seg", 0, 9))
+    assert len(published.segments) == 1
+
+
+def test_publish_leaves_rangeless_segments_alone():
+    """A segment with no recorded range cannot be proven to overlap, so it is
+    never evicted on a guess."""
+    legacy = SegmentMeta("legacy.seg", 5, 100, 0, 0)
+    published = Manifest().with_segments([legacy]).publish(_ranged("new.seg", 0, 9))
+    assert [s.key for s in published.segments] == ["legacy.seg", "new.seg"]
+
+
+@pytest.mark.parametrize(
+    "first, last, expected",
+    [
+        (100, 104, True),   # identical
+        (100, 101, True),   # contained
+        (104, 200, True),   # touches the last offset
+        (0, 100, True),     # touches the first
+        (105, 200, False),  # entirely after
+        (0, 99, False),     # entirely before
+    ],
+)
+def test_range_overlap(first, last, expected):
+    assert _ranged("s.seg", 100, 104).covers(first, last) is expected
