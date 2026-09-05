@@ -31,6 +31,7 @@ from __future__ import annotations
 import os
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Iterator
@@ -45,7 +46,9 @@ from aether.storage.counting import CountingStore, ReadStats
 INDEX_URI_ENV = "AETHER_INDEX"
 MODEL_URI_ENV = "AETHER_MODEL"
 DEFAULT_INDEX_URI = "data/idx1m"
-DEFAULT_MODEL_URI = "data/model.pkl"
+# The numpy format, not the pickle: serving must not import
+# scikit-learn and must not unpickle an object from a bucket.
+DEFAULT_MODEL_URI = "data/model.npz"
 
 
 @dataclass(frozen=True)
@@ -95,25 +98,39 @@ class ServiceState:
         refuses to boot without a model cannot serve search either, and an
         instance that exits on startup is far harder to diagnose than one
         that answers `/health` with the reason it is degraded.
+
+        The two reads run at once. They share nothing, and a cold start is
+        almost entirely waiting on object storage rather than working, so
+        doing them in sequence adds a full round trip to the first request
+        made after every idle period. Same shape as the coordinator's
+        fan-out: latency here is bound by the depth of the chain of waits,
+        not by how much is read.
         """
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            waiting = [pool.submit(self._load_index), pool.submit(self._load_model)]
+            for job in waiting:
+                job.result()
+
+    def _load_index(self) -> None:
         try:
             self.coordinator.refresh()
         except Exception as error:  # noqa: BLE001 - reported, not swallowed
             self.index_error = f"{type(error).__name__}: {error}"
 
+    def _load_model(self) -> None:
         if not self.model_uri:
             self.model_error = "no model configured"
             return
         try:
-            from aether.ml.model import ModelArtifact
+            from aether.ml.loader import model_from_bytes
             from aether.storage.factory import open_object
 
             # Read straight into memory: the artifact never touches a
             # filesystem, because a scale-to-zero container may not have a
             # writable one and copying it through disk buys nothing.
             store, key = open_object(self.model_uri)
-            self.model = ModelArtifact.from_bytes(
-                store.get_range(key, 0, store.size(key))
+            self.model = model_from_bytes(
+                store.get_range(key, 0, store.size(key)), key
             )
         except Exception as error:  # noqa: BLE001
             self.model_error = f"{type(error).__name__}: {error}"
@@ -168,6 +185,7 @@ class ServiceState:
             return {"loaded": False, "error": self.model_error}
         return {
             "loaded": True,
+            "format": "numpy" if self.model_uri.endswith(".npz") else "pickle",
             "version": self.model.version,
             "trained_at": self.model.trained_at,
             "trained_on_events": self.model.trained_on_events,

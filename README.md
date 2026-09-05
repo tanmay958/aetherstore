@@ -404,30 +404,66 @@ exactly how train/serve skew gets in.
 
 ### Cold start
 
-Measured in the container, against R2:
+A scale-to-zero service pays this on the first request after every idle
+period, so it is the number worth attacking. Measured in the container,
+against R2:
 
 ```
-load index + model from R2   1,433 ms
-import scikit-learn            783 ms
-numpy, boto3, fastapi          496 ms
-                             -------
-                             2,718 ms
+                              before    after
+import scikit-learn            783 ms       -     dropped
+numpy, boto3, fastapi          496 ms   658 ms
+load index and model from R2 1,433 ms   614 ms    concurrent, smaller model
+                             --------  --------
+                             2,718 ms 1,273 ms
+image (uncompressed)           693 MB   412 MB
 ```
 
-That is the number a scale-to-zero deployment pays on its first request.
-scikit-learn is 783 ms of it and most of the 693 MB image, for a gradient
-boosting model that is ultimately a pile of thresholds; exporting it to a
-numpy-only scorer is the obvious next cut and is not done yet.
+Two changes, and neither was a micro-optimisation.
 
-The image deliberately excludes the Kafka client. A container that scales to
-zero cannot be a consumer, so shipping librdkafka would pay tens of megabytes
-for something that can never run there.
+**The model no longer needs scikit-learn.** A fitted gradient boosting
+ensemble is a pile of thresholds; `aether.ml.export` writes it out as flat
+numpy arrays with a JSON header. Serving loads that instead of the pickle:
+783 ms and most of the image, for code that runs during training and never
+again. The exported scorer agrees with scikit-learn to 1.7e-16, and is 98
+times faster on the single-row scoring that serving actually does, 0.090 ms
+against 8.783 ms, because it skips the array overhead for one row.
+
+The stronger reason is not speed. **Unpickling a model is arbitrary code
+execution**, so loading a `.pkl` from a bucket means whoever can write to that
+bucket runs code in the serving container. The `.npz` is read with
+`allow_pickle=False`: it is data, and cannot execute.
+
+**The index and the model load at once.** They share nothing, and a cold start
+is almost all waiting rather than working, so doing them in sequence added a
+full round trip. The same point compaction made: latency here is bound by the
+depth of the chain of waits, not by how much is read.
+
+What remains is 614 ms of object storage round trips and 658 ms of importing
+numpy, boto3 and fastapi. Both are close to the floor for this shape.
+
+The image deliberately excludes the Kafka client too. A container that scales
+to zero cannot be a consumer, so shipping librdkafka would pay tens of
+megabytes for something that can never run there.
+
+### Two model formats
+
+```
+model.pkl   723 KB   scikit-learn, for retraining and explaining
+model.npz   137 KB   numpy only, for serving
+```
+
+`aether.ml.train` writes both. Serving should always be pointed at the `.npz`;
+`/api/model` reports which one a container actually loaded, so an operator can
+tell.
 
 ## Layout
 
 ```
 src/aether/
 ├── events.py          canonical event schema, the boundary everything targets
+├── ml/
+│   ├── export.py      fitted trees -> flat numpy arrays, no pickle
+│   └── loader.py      picks the format by suffix
 ├── service/
 │   ├── app.py         FastAPI: /api/search, /api/predict, /health
 │   ├── state.py       index and model, loaded once per process

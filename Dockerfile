@@ -9,7 +9,7 @@
 #   docker build -t aether .
 #   docker run -p 8000:8000 --env-file .env \
 #     -e AETHER_INDEX=r2://aether/idx100k \
-#     -e AETHER_MODEL=r2://aether/models/model.pkl aether
+#     -e AETHER_MODEL=r2://aether/models/model.npz aether
 
 FROM python:3.13-slim AS build
 
@@ -19,7 +19,10 @@ WORKDIR /app
 # Dependencies first, so a code change does not reinstall scikit-learn.
 COPY pyproject.toml README.md ./
 COPY src/ src/
-RUN pip install --prefix=/install ".[s3,ml,service]"
+# No `ml` extra: serving reads the numpy export, so scikit-learn is a
+# build-time dependency of the model and not a runtime one. It was 783 ms
+# of cold start and most of the image.
+RUN pip install --prefix=/install ".[s3,service]"
 
 
 FROM python:3.13-slim

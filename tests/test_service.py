@@ -36,14 +36,22 @@ def indexed(tmp_path, sample_csv):
     return store
 
 
-@pytest.fixture
-def model(tmp_path, sample_csv):
-    """A model trained on the fixture. Tiny and bad, which does not matter:
-    these tests are about plumbing, not accuracy."""
+@pytest.fixture(params=["pkl", "npz"])
+def model(request, tmp_path, sample_csv):
+    """A model trained on the fixture, in both formats.
+
+    Every test taking this fixture therefore runs twice: once against the
+    scikit-learn pickle and once against the numpy export that production
+    actually serves. The two must be interchangeable, and this is what proves
+    it rather than an assertion somewhere that they ought to be.
+
+    Tiny and bad as a model, which does not matter: these are plumbing tests.
+    """
     pytest.importorskip("sklearn")
     import time
 
     from aether.ml.dataset import build_dataset
+    from aether.ml.export import export
     from aether.ml.features import FEATURE_NAMES
     from aether.ml.model import ModelArtifact
     from aether.ml.train import fit_model
@@ -56,8 +64,12 @@ def model(tmp_path, sample_csv):
         trained_at=time.time(),
         trained_on_events=len(data),
     )
-    path = tmp_path / "model.pkl"
-    artifact.save(path)
+    if request.param == "pkl":
+        path = tmp_path / "model.pkl"
+        artifact.save(path)
+    else:
+        path = tmp_path / "model.npz"
+        export(artifact).save(path)
     return path
 
 
@@ -281,14 +293,14 @@ def test_an_empty_session_is_rejected(client):
 def test_http_and_streaming_agree_exactly(client, model):
     """The endpoint drives `Predictor.handle`, the same function the Kafka
     replicas run. If anyone reimplements scoring for HTTP, this fails."""
-    from aether.ml.model import ModelArtifact
+    from aether.ml.loader import load_model
     from aether.stream.config import KafkaConfig
     from aether.stream.predictor import Predictor
 
     events = session_events()
     body = client.post("/api/predict", json={"events": events}).json()
 
-    predictor = Predictor(ModelArtifact.load(model), KafkaConfig(), output_topic=None)
+    predictor = Predictor(load_model(model), KafkaConfig(), output_topic=None)
     expected = []
     for index, event in enumerate(events):
         full = {"event_id": f"http-{index}", "session_id": "http-session",
@@ -308,3 +320,10 @@ def test_each_request_starts_from_a_clean_session(client):
     first = client.post("/api/predict", json={"events": events}).json()
     second = client.post("/api/predict", json={"events": events}).json()
     assert first == second
+
+
+def test_the_model_card_says_which_format_was_loaded(client, model):
+    """An operator must be able to tell whether a container is serving the
+    numpy export or dragging scikit-learn in behind a pickle."""
+    body = client.get("/api/model").json()
+    assert body["format"] == ("numpy" if model.suffix == ".npz" else "pickle")

@@ -265,8 +265,18 @@ def main(argv: list[str] | None = None) -> int:
     )
     written = artifact.save(args.out)
     print()
-    print(f"wrote {args.out}  ({written / 1024:,.0f} KB)")
+    print(f"wrote {args.out}  ({written / 1024:,.0f} KB)   scikit-learn, for retraining")
     print(f"      {args.out.with_suffix('.json')}  (metrics, readable without unpickling)")
+
+    # And the serving format. Two files rather than one because they have
+    # different jobs: the pickle can still fit and explain itself, and the
+    # export is what a container should load, since it needs no scikit-learn
+    # and cannot execute anything on the way in.
+    from aether.ml.export import export
+
+    numpy_path = args.out.with_suffix(".npz")
+    numpy_written = export(artifact).save(numpy_path)
+    print(f"      {numpy_path}  ({numpy_written / 1024:,.0f} KB)   numpy only, for serving")
     return 0
 
 

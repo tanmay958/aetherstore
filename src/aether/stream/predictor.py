@@ -46,7 +46,7 @@ the partition rebuilds state from its own reading of the log, and holding on
 would mean two replicas predicting for the same session from different halves
 of its history.
 
-    python -m aether.stream.predictor --model data/model.pkl
+    python -m aether.stream.predictor --model data/model.npz
 """
 
 from __future__ import annotations
@@ -59,7 +59,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from aether.env import load_dotenv
-from aether.ml.model import ModelArtifact
+from aether.ml.loader import load_model
 from aether.ml.session import SESSION_TIMEOUT_SECONDS, SessionState
 from aether.stream.config import KafkaConfig
 
@@ -116,7 +116,7 @@ class Predictor:
 
     def __init__(
         self,
-        model: ModelArtifact,
+        model,
         config: KafkaConfig,
         *,
         output_topic: str | None = DEFAULT_OUTPUT_TOPIC,
@@ -319,7 +319,7 @@ def main(argv: list[str] | None = None) -> int:
         prog="aether.stream.predictor",
         description="Score live sessions for cart abandonment.",
     )
-    parser.add_argument("--model", type=Path, default=Path("data/model.pkl"))
+    parser.add_argument("--model", type=Path, default=Path("data/model.npz"))
     parser.add_argument("--group", default=DEFAULT_GROUP, help="consumer group")
     parser.add_argument("--output-topic", default=DEFAULT_OUTPUT_TOPIC)
     parser.add_argument("--no-output", action="store_true", help="do not publish")
@@ -333,7 +333,7 @@ def main(argv: list[str] | None = None) -> int:
     if not args.model.exists():
         parser.error(f"{args.model} not found. Train one with: python -m aether.ml.train")
 
-    artifact = ModelArtifact.load(args.model)
+    artifact = load_model(args.model)
     base = KafkaConfig.from_env()
     config = KafkaConfig(base.bootstrap_servers, base.topic, args.group)
 
@@ -354,7 +354,7 @@ def main(argv: list[str] | None = None) -> int:
     handle = args.log.open("a") if args.log else None
     sink = (lambda p: handle.write(p.to_json() + "\n")) if handle else None
 
-    pr = artifact.metrics.get("model", {}).get("pr_auc")
+    pr = (artifact.metrics or {}).get("model", {}).get("pr_auc")
     print(f"predictor  group={config.group_id}  topic={config.topic}")
     print(f"  model trained on {artifact.trained_on_events:,} events"
           + (f", PR-AUC {pr:.4f}" if pr else ""))
