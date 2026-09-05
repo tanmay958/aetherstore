@@ -23,6 +23,11 @@
 
 * { box-sizing: border-box; }
 
+/* A class that sets `display` outranks the browser's own `[hidden]` rule, so
+   `.cost` and `.pager` stayed visible while empty. Anything hidden is hidden,
+   whatever else it is styled as. */
+[hidden] { display: none !important; }
+
 html { -webkit-text-size-adjust: 100%; }
 
 body {
@@ -306,3 +311,88 @@ button.ghost:hover:not(:disabled) { color: var(--ink); background: var(--bg-sunk
 
 footer { border-top: 1px solid var(--line); margin-top: 20px; padding: 20px 24px 44px; }
 footer p { color: var(--ink-faint); font-size: 12px; margin: 0; max-width: 76ch; }
+
+/* ── results, rebuilt ─────────────────────────────────────────────── */
+
+.results li {
+  display: block;
+  padding: 14px 16px;
+  transition: border-color .13s;
+}
+.results li:hover { border-color: var(--line); }
+
+.results .row { display: flex; gap: 16px; align-items: baseline; justify-content: space-between; }
+.results .title { font-weight: 560; letter-spacing: -.005em; line-height: 1.35; }
+.results .price { font: 600 14px var(--mono); white-space: nowrap; }
+
+.results .meta {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  align-items: center;
+  margin-top: 8px;
+  font: 11.5px var(--mono);
+  color: var(--ink-faint);
+}
+.results .tag {
+  background: var(--bg-sunken);
+  border: 1px solid var(--line-soft);
+  border-radius: 5px;
+  padding: 2px 7px;
+  color: var(--ink-dim);
+}
+.results .tag.kind { color: var(--accent); border-color: rgba(90,200,250,.25); }
+.results .tag.fresh { color: var(--good); border-color: rgba(86,211,100,.3); }
+.results .rank { color: var(--ink-faint); min-width: 26px; font: 11.5px var(--mono); }
+.results .bar { height: 3px; background: var(--bg-sunken); border-radius: 2px; margin-top: 9px; overflow: hidden; }
+.results .bar i { display: block; height: 100%; background: var(--accent-dim); border-radius: 2px; }
+
+.pager { display: flex; gap: 10px; align-items: center; justify-content: center; margin-top: 18px; }
+.pager button { padding: 8px 15px; font-size: 13px; }
+.pager span { color: var(--ink-faint); font: 12.5px var(--mono); min-width: 150px; text-align: center; }
+
+/* ── live panel ───────────────────────────────────────────────────── */
+
+.live-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; align-items: start; }
+@media (max-width: 760px) { .live-grid { grid-template-columns: 1fr; } }
+
+.live-head { display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 16px; }
+.live-count { display: block; font: 660 30px/1 var(--mono); letter-spacing: -.02em; color: var(--accent); }
+.live-head small { color: var(--ink-faint); font-size: 11px; text-transform: uppercase; letter-spacing: .08em; }
+
+.pulse { width: 9px; height: 9px; border-radius: 50%; background: var(--good); margin-top: 6px; animation: beat 1.1s ease-in-out infinite; }
+@keyframes beat { 0%, 100% { opacity: 1; transform: scale(1); } 50% { opacity: .35; transform: scale(.8); } }
+@media (prefers-reduced-motion: reduce) { .pulse { animation: none; } }
+
+#stream-rate {
+  background: var(--bg-sunken); border: 1px solid var(--line); border-radius: var(--radius);
+  color: var(--ink-dim); font: 13px var(--sans); padding: 0 10px;
+}
+
+.ticker { list-style: none; margin: 14px 0 0; padding: 0; max-height: 190px; overflow-y: auto; }
+.ticker li {
+  font: 11.5px/1.7 var(--mono);
+  color: var(--ink-faint);
+  border-top: 1px solid var(--line-soft);
+  padding: 5px 0;
+  display: flex; justify-content: space-between; gap: 12px;
+}
+.ticker li b { color: var(--accent); font-weight: 600; }
+.ticker li.seal { color: var(--good); }
+
+#event-form h3 { margin: 0 0 14px; font-size: 14px; font-weight: 600; }
+#event-form label { display: block; color: var(--ink-faint); font-size: 11px; text-transform: uppercase; letter-spacing: .08em; margin: 0 0 6px; }
+#event-form label small { text-transform: none; letter-spacing: 0; margin-left: 6px; color: var(--ink-faint); font-size: 11px; }
+#event-form input, #event-form select {
+  width: 100%;
+  background: var(--bg-sunken); border: 1px solid var(--line); border-radius: 8px;
+  color: var(--ink); font: 13.5px var(--mono); padding: 9px 10px; margin-bottom: 13px;
+}
+#event-form input:focus, #event-form select:focus {
+  outline: none; border-color: var(--accent-dim); box-shadow: 0 0 0 3px rgba(31,111,235,.2);
+}
+#event-form .pair { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+#event-form button { width: 100%; }
+#event-result { min-height: 34px; }
+#event-result.good { color: var(--good); }
+#event-result.bad { color: var(--danger); }

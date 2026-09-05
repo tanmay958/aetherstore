@@ -55,6 +55,9 @@ INDEX_URI_ENV = "AETHER_INDEX"
 # Set to "manifests/" to serve an index the streaming indexer produced, which
 # has one manifest per Kafka partition rather than one for the whole index.
 MANIFEST_PREFIX_ENV = "AETHER_MANIFEST_PREFIX"
+# Ingestion is off unless asked for, because it needs a writable index and,
+# more importantly, exactly one writer. See service/ingest.py.
+WRITABLE_ENV = "AETHER_WRITABLE"
 MODEL_URI_ENV = "AETHER_MODEL"
 DEFAULT_INDEX_URI = "data/idx1m"
 # The numpy format, not the pickle: serving must not import
@@ -86,6 +89,7 @@ class ServiceState:
         model_uri: str | None = DEFAULT_MODEL_URI,
         max_workers: int = 16,
         refresh_seconds: float = DEFAULT_REFRESH_SECONDS,
+        writable: bool = False,
     ) -> None:
         # Counting wraps the store rather than the coordinator so that every
         # read is seen, including the ones the model load makes.
@@ -112,6 +116,11 @@ class ServiceState:
         self.model = None
         self.model_error: str | None = None
         self.index_error: str | None = None
+        self.write_error: str | None = None
+        # Both are built during load(), and stay None on a read-only instance.
+        self.ingestor = None
+        self.feed = None
+        self.writable = writable
 
     # -- loading -----------------------------------------------------------
 
@@ -134,6 +143,29 @@ class ServiceState:
             waiting = [pool.submit(self._load_index), pool.submit(self._load_model)]
             for job in waiting:
                 job.result()
+        if self.writable:
+            self._open_for_writing()
+
+    def _open_for_writing(self) -> None:
+        """Attach an ingestor and a feed, if this instance is the writer.
+
+        Failure is recorded on the ingestor being absent rather than raised:
+        an instance that cannot write is still perfectly able to search, and
+        the endpoints say so with a 503 rather than the process refusing to
+        start.
+        """
+        from aether.service.feed import Feed
+        from aether.service.ingest import LiveIngestor
+
+        try:
+            self.ingestor = LiveIngestor(self.store)
+            # Resume roughly where a previous instance stopped, derived from
+            # the manifest rather than from a stored cursor.
+            self.feed = Feed(self.store, start_after=self.ingestor.documents)
+        except Exception as error:  # noqa: BLE001
+            self.ingestor = None
+            self.feed = None
+            self.write_error = f"{type(error).__name__}: {error}"
 
     def _load_index(self) -> None:
         try:
@@ -234,6 +266,7 @@ class ServiceState:
             "documents": manifest.docs,
             "segments": len(manifest.segments),
             "bytes": manifest.bytes,
+            "writable": self.ingestor is not None,
             "source": (
                 f"{self.manifest_prefix}* (one per Kafka partition)"
                 if self.manifest_prefix
@@ -268,6 +301,7 @@ def state_from_env() -> ServiceState:
         open_store(uri),
         manifest_prefix=os.environ.get(MANIFEST_PREFIX_ENV) or None,
         model_uri=model_uri or None,
+        writable=os.environ.get(WRITABLE_ENV, "").lower() in {"1", "true", "yes"},
         refresh_seconds=float(
             os.environ.get(REFRESH_SECONDS_ENV, DEFAULT_REFRESH_SECONDS)
         ),

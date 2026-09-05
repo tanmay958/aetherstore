@@ -554,3 +554,14 @@ def test_a_refresh_that_fails_keeps_serving(tmp_path, sample_csv):
 
     _time.sleep(0.01)
     assert client.get("/api/search?q=samsung").status_code == 200
+
+
+def test_static_assets_carry_a_cache_header(client):
+    """Starlette sends etag and last-modified but no cache-control, which
+    leaves a browser to guess, and the usual guess is a fraction of the file's
+    age. That is how a redeployed page keeps running yesterday's JavaScript
+    against today's API with nothing reporting an error."""
+    for path in ("/", "/style.css", "/app.js"):
+        response = client.get(path)
+        assert response.status_code == 200, path
+        assert "max-age" in response.headers.get("cache-control", ""), path

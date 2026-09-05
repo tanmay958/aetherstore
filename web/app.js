@@ -61,15 +61,15 @@ async function loadFacts() {
     $('fact-segments').textContent = index.segments ?? '·';
     $('fact-bytes').textContent = bytes(index.bytes ?? 0);
   } catch {
-    $('fact-docs').textContent = '—';
+    $('fact-docs').textContent = '-';
   }
   try {
     const model = await api('/model');
     const pr = model.metrics?.model?.pr_auc;
-    $('fact-model').textContent = pr ? pr.toFixed(3) : (model.loaded ? 'loaded' : '—');
+    $('fact-model').textContent = pr ? pr.toFixed(3) : (model.loaded ? 'loaded' : '-');
     $('fact-model').title = pr ? 'PR-AUC on a held-out future' : '';
   } catch {
-    $('fact-model').textContent = '—';
+    $('fact-model').textContent = '-';
   }
 }
 
@@ -77,10 +77,15 @@ async function loadFacts() {
 
 const form = $('search-form');
 
-async function runSearch(event) {
+/* Page state lives here rather than in the URL: the page is one screen and a
+ * visitor paging through results is not navigating. */
+let page = { q: '', offset: 0, limit: 10, total: 0, max: 500 };
+
+async function runSearch(event, offset = 0) {
   event?.preventDefault();
   const q = $('q').value.trim();
   if (!q) return;
+  page.offset = offset;
 
   const button = form.querySelector('button');
   button.disabled = true;
@@ -88,7 +93,10 @@ async function runSearch(event) {
   $('search-status').textContent = 'searching…';
 
   try {
-    const params = new URLSearchParams({ q, k: '10', mode: $('mode').value, explain: 'true' });
+    const params = new URLSearchParams({
+      q, k: String(page.limit), offset: String(page.offset),
+      mode: $('mode').value, explain: 'true',
+    });
     const data = await api(`/search?${params}`);
 
     $('cost').hidden = false;
@@ -98,42 +106,22 @@ async function runSearch(event) {
     $('cost-segments').textContent = `${data.cost.segments_searched}/${data.cost.segments_total}`;
     $('cost-pruned').textContent = data.cost.segments_pruned;
 
+    page = { ...page, q, total: data.total, max: data.max_offset ?? 500 };
+    const from = data.total ? page.offset + 1 : 0;
+    const to = page.offset + data.hits.length;
     $('search-status').textContent =
-      `${commas(data.total)} matching event${data.total === 1 ? '' : 's'}, showing ${data.hits.length}`;
+      `${commas(data.total)} matching event${data.total === 1 ? '' : 's'}` +
+      (data.total ? `, showing ${commas(from)}\u2013${commas(to)}` : '');
+    renderPager();
 
-    $('results').replaceChildren(...data.hits.map((hit) => {
-      const d = hit.document;
-      const li = document.createElement('li');
-      const title = document.createElement('div');
-      title.className = 'title';
-      title.textContent = d.title || d.product_id || '(untitled)';
-      const price = document.createElement('div');
-      price.className = 'price';
-      price.textContent = d.price != null ? money(d.price) : '—';
-      const meta = document.createElement('div');
-      meta.className = 'meta';
-      // The index holds events, not products, so the same product legitimately
-      // appears several times. Without the timestamp those rows look like a
-      // bug rather than like three people viewing one phone.
-      const when = new Date(d.ts * 1000).toISOString().slice(0, 19).replace('T', ' ');
-      for (const [cls, text] of [
-        ['score', `BM25 ${hit.score.toFixed(3)}`],
-        ['', d.event_type],
-        ['', when],
-        ['', d.brand || 'no brand'],
-        ['', d.category || 'no category'],
-      ]) {
-        const span = document.createElement('span');
-        if (cls) span.className = cls;
-        span.textContent = text;
-        meta.append(span);
-      }
-      li.append(title, price, meta);
-      return li;
-    }));
+    const best = data.hits.length ? data.hits[0].score : 1;
+    $('results').replaceChildren(
+      ...data.hits.map((hit, i) => renderHit(hit, i, best)),
+    );
 
-    if (!data.hits.length) {
-      $('search-status').textContent = 'nothing matched. Try "any term", or a broader query.';
+    if (!data.hits.length && !page.offset) {
+      $('search-status').textContent =
+        'nothing matched. Try "any term", or index it yourself under Live index.';
     }
     rememberProducts(data.hits);
   } catch (error) {
@@ -145,7 +133,76 @@ async function runSearch(event) {
   }
 }
 
-form.addEventListener('submit', runSearch);
+function renderHit(hit, i, best) {
+  const d = hit.document;
+  const li = document.createElement('li');
+
+  const row = document.createElement('div');
+  row.className = 'row';
+  const left = document.createElement('div');
+  const rank = document.createElement('span');
+  rank.className = 'rank';
+  rank.textContent = `${page.offset + i + 1}.`;
+  const title = document.createElement('span');
+  title.className = 'title';
+  title.textContent = d.title || d.product_id || '(untitled)';
+  left.append(rank, title);
+  const price = document.createElement('div');
+  price.className = 'price';
+  price.textContent = d.price != null ? money(d.price) : '\u2014';
+  row.append(left, price);
+
+  const meta = document.createElement('div');
+  meta.className = 'meta';
+  // The index holds events, not products, so one product legitimately appears
+  // many times. The timestamp is what stops those rows looking like a bug.
+  const when = new Date(d.ts * 1000).toISOString().slice(0, 19).replace('T', ' ');
+  const tags = [
+    ['tag kind', d.event_type],
+    ['tag', d.brand || 'no brand'],
+    ['tag', d.category || 'no category'],
+  ];
+  if (justIndexed.has(d.product_id)) tags.push(['tag fresh', 'you indexed this']);
+  for (const [cls, text] of tags) {
+    const span = document.createElement('span');
+    span.className = cls;
+    span.textContent = text;
+    meta.append(span);
+  }
+  const stamp = document.createElement('span');
+  stamp.textContent = `${when}  ·  BM25 ${hit.score.toFixed(3)}`;
+  meta.append(stamp);
+
+  // Relative to the best hit on this page, so the ranking is visible without
+  // anyone having to know what a BM25 score means.
+  const bar = document.createElement('div');
+  bar.className = 'bar';
+  const fill = document.createElement('i');
+  fill.style.width = `${Math.max(4, (hit.score / best) * 100)}%`;
+  bar.append(fill);
+
+  li.append(row, meta, bar);
+  return li;
+}
+
+function renderPager() {
+  const pages = Math.ceil(page.total / page.limit);
+  const here = Math.floor(page.offset / page.limit) + 1;
+  const capped = page.offset + page.limit > page.max;
+
+  $('pager').hidden = page.total <= page.limit;
+  $('page-label').textContent = `page ${commas(here)} of ${commas(pages)}`;
+  $('prev').disabled = page.offset === 0;
+  $('next').disabled = here >= pages || capped;
+  $('depth-note').hidden = !capped;
+}
+
+$('prev').addEventListener('click', () =>
+  runSearch(null, Math.max(0, page.offset - page.limit)));
+$('next').addEventListener('click', () =>
+  runSearch(null, page.offset + page.limit));
+
+form.addEventListener('submit', (e) => runSearch(e, 0));
 
 /* ── prediction ────────────────────────────────────────────────────── */
 
@@ -236,7 +293,7 @@ function render(data) {
     fill.style.width = `${pct * 100}%`;
     $('gauge-label').textContent = pct >= 0.7 ? 'likely to abandon this cart' : 'chance of abandoning this cart';
   } else {
-    value.textContent = '—';
+    value.textContent = '-';
     value.className = 'gauge-value';
     fill.style.width = '0';
     fill.className = 'gauge-fill';
@@ -285,7 +342,174 @@ $('reset').addEventListener('click', () => {
   render(null);
 });
 
+/* ── live index ────────────────────────────────────────────────────── */
+
+/* Events this visitor indexed, so their own rows can be marked in the
+ * results. Session-scoped and never sent anywhere. */
+const justIndexed = new Set();
+
+let stream = null;          // the open EventSource, when streaming
+let keepStreaming = false;  // whether to reconnect when one burst ends
+
+function tick(text, value, kind) {
+  const li = document.createElement('li');
+  const label = document.createElement('span');
+  label.textContent = text;
+  const bold = document.createElement('b');
+  bold.textContent = value;
+  if (kind) li.className = kind;
+  li.append(label, bold);
+  $('ticker').prepend(li);
+  while ($('ticker').children.length > 40) $('ticker').lastChild.remove();
+}
+
+/* `documents` is the whole index; `ingested` is only the partition this
+ * service writes. Showing the latter as the total made the header collapse
+ * from 142,152 to 2,153 the moment a burst began. */
+function setCounts(d) {
+  if (d.documents != null) {
+    $('live-count').textContent = commas(d.documents);
+    $('fact-docs').textContent = commas(d.documents);
+  }
+}
+
+function setStreaming(on) {
+  keepStreaming = on;
+  $('stream-toggle').textContent = on ? 'Stop streaming' : 'Start streaming';
+  $('stream-toggle').classList.toggle('primary', !on);
+  $('pulse').hidden = !on;
+  $('stream-rate').disabled = on;
+}
+
+function openStream() {
+  // A burst is bounded by the server, because Cloud Run throttles CPU outside
+  // a request and work left running after a response would stall silently.
+  // Reconnecting is what makes it continuous for as long as someone watches.
+  const rate = $('stream-rate').value;
+  stream = new EventSource(`${API}/stream?seconds=45&rate=${rate}`);
+
+  stream.addEventListener('start', (e) => {
+    const d = JSON.parse(e.data);
+    setCounts(d);
+    tick('burst started', `${d.rate}/sec`);
+  });
+
+  stream.addEventListener('progress', (e) => {
+    const d = JSON.parse(e.data);
+    setCounts(d);
+    if (d.sealed) {
+      tick('segment sealed', d.sealed.split('/').pop().slice(0, 22), 'seal');
+    }
+  });
+
+  stream.addEventListener('exhausted', () => {
+    tick('feed exhausted', 'stopping');
+    setStreaming(false);
+    closeStream();
+  });
+
+  stream.addEventListener('done', (e) => {
+    const d = JSON.parse(e.data);
+    setCounts(d);
+    closeStream();
+    // The server ended the burst, not the visitor, so start another.
+    if (keepStreaming) openStream();
+  });
+
+  stream.onerror = () => {
+    // EventSource retries by itself, which would fight the reconnect above.
+    closeStream();
+    if (keepStreaming) {
+      tick('reconnecting', '…');
+      setTimeout(() => { if (keepStreaming) openStream(); }, 1500);
+    }
+  };
+}
+
+function closeStream() {
+  if (stream) { stream.close(); stream = null; }
+}
+
+$('stream-toggle').addEventListener('click', () => {
+  if (keepStreaming) {
+    setStreaming(false);
+    closeStream();
+    tick('stopped', 'by you');
+  } else {
+    setStreaming(true);
+    openStream();
+  }
+});
+
+// A tab in the background should not keep indexing.
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden && keepStreaming) {
+    setStreaming(false);
+    closeStream();
+    tick('paused', 'tab hidden');
+  }
+});
+
+/* ── indexing one event by hand ─────────────────────────────────────── */
+
+$('event-form').addEventListener('submit', async (event) => {
+  event.preventDefault();
+  const note = $('event-result');
+  const button = $('event-form').querySelector('button');
+  button.disabled = true;
+  note.className = 'note';
+  note.textContent = 'indexing…';
+
+  const title = $('ev-title').value.trim();
+  const payload = {
+    ts: Math.floor(Date.now() / 1000),
+    event_type: $('ev-type').value,
+    session_id: `web-${Math.random().toString(36).slice(2, 8)}`,
+    product_id: `custom-${Math.random().toString(36).slice(2, 8)}`,
+    title,
+    brand: $('ev-brand').value.trim() || null,
+    category: $('ev-category').value.trim() || null,
+    price: Number($('ev-price').value) || null,
+  };
+
+  try {
+    const result = await api('/events', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ events: [payload] }),
+    });
+    justIndexed.add(payload.product_id);
+    // The header counts documents too, and leaving it behind makes the page
+    // look like the event did not land.
+    const index = await api('/index');
+    $('live-count').textContent = commas(index.documents);
+    $('fact-docs').textContent = commas(index.documents);
+    $('fact-segments').textContent = index.segments;
+    note.className = 'note good';
+    note.textContent =
+      `sealed into ${result.segment.split('/').pop()} in ${result.took_ms} ms `
+      + '- searching for it now';
+    tick('indexed by hand', title.slice(0, 22), 'seal');
+
+    // Prove the round trip rather than asserting it: search for what was
+    // just typed, and show the visitor the result.
+    $('q').value = title;
+    document.querySelector('[data-panel="search"]').click();
+    await runSearch(null, 0);
+  } catch (error) {
+    note.className = 'note bad';
+    note.textContent = error.message;
+  } finally {
+    button.disabled = false;
+  }
+});
+
 /* ── go ────────────────────────────────────────────────────────────── */
 
 loadFacts();
 runSearch();
+
+// The live panel's counter shares the index count the header already fetches.
+api('/index')
+  .then((d) => { $('live-count').textContent = commas(d.documents); })
+  .catch(() => { $('live-count').textContent = '\u2014'; });

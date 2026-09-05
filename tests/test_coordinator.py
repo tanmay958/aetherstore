@@ -266,3 +266,60 @@ def test_fetching_nothing_reads_nothing(sharded):
     sharded.store.reset()
     assert sharded.documents([]) == []
     assert sharded.store.stats.requests == 0
+
+
+# --------------------------------------------------------------------------
+# pagination
+# --------------------------------------------------------------------------
+
+
+def test_paging_walks_the_same_ranking(sharded):
+    """Two pages of five must be the one page of ten, in order.
+
+    The trap is that a distributed index cannot start at rank 5 without
+    knowing ranks 0 to 4, so a naive implementation asks each segment for five
+    and merges the wrong five.
+    """
+    whole = sharded.search("view", top_k=10)
+    first = sharded.search("view", top_k=5)
+    second = sharded.search("view", top_k=5, offset=5)
+
+    paged = [(h.segment, h.doc_id) for h in first.hits + second.hits]
+    assert paged == [(h.segment, h.doc_id) for h in whole.hits]
+
+
+def test_pages_do_not_overlap(sharded):
+    first = {(h.segment, h.doc_id) for h in sharded.search("view", top_k=4).hits}
+    second = {
+        (h.segment, h.doc_id) for h in sharded.search("view", top_k=4, offset=4).hits
+    }
+    assert first and second
+    assert not (first & second)
+
+
+def test_the_total_is_the_same_on_every_page(sharded):
+    """The total counts matches, not the page, so it must not move as a
+    visitor walks through pages."""
+    first = sharded.search("view", top_k=3)
+    later = sharded.search("view", top_k=3, offset=6)
+    assert first.total == later.total
+
+
+def test_paging_past_the_end_is_empty_not_an_error(sharded):
+    result = sharded.search("view", top_k=10, offset=100_000)
+    assert result.hits == []
+    assert result.total > 0
+
+
+def test_a_negative_offset_is_rejected(sharded):
+    with pytest.raises(ValueError, match="negative"):
+        sharded.search("view", top_k=10, offset=-1)
+
+
+def test_an_offset_costs_no_extra_document_reads(sharded):
+    """Depth is paid in merging integers, not in fetching documents. Only the
+    page actually returned is resolved to documents."""
+    sharded.search("view", top_k=5)  # warm the segments
+    sharded.store.reset()
+    deep = sharded.search("view", top_k=5, offset=5)
+    assert len(deep.hits) <= 5

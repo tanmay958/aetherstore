@@ -30,6 +30,7 @@
 
 <nav class="tabs wrap" role="tablist">
   <button role="tab" aria-selected="true"  data-panel="search">Search</button>
+  <button role="tab" aria-selected="false" data-panel="live">Live index</button>
   <button role="tab" aria-selected="false" data-panel="predict">Prediction</button>
   <button role="tab" aria-selected="false" data-panel="about">How it works</button>
 </nav>
@@ -64,6 +65,92 @@
 
     <p class="status" id="search-status"></p>
     <ol class="results" id="results"></ol>
+
+    <nav class="pager" id="pager" hidden>
+      <button id="prev" type="button">&larr; Previous</button>
+      <span id="page-label"></span>
+      <button id="next" type="button">Next &rarr;</button>
+    </nav>
+    <p class="note" id="depth-note" hidden>
+      Paging stops here on purpose. A distributed index cannot start at rank
+      500 without first merging everything above it, so every engine that fans
+      out caps the depth instead of pretending it is free.
+    </p>
+  </section>
+
+  <!-- ──────────────────────────── live ───────────────────────────── -->
+  <section id="panel-live" class="panel" hidden>
+    <p class="hint">
+      This index is writable. Events indexed here are sealed into a segment,
+      published in a manifest and searchable before the request returns, which
+      you can check by adding one below and searching for it.
+    </p>
+
+    <div class="live-grid">
+      <div class="controls">
+        <div class="live-head">
+          <div>
+            <span class="live-count" id="live-count">·</span>
+            <small>documents indexed</small>
+          </div>
+          <span class="pulse" id="pulse" hidden></span>
+        </div>
+
+        <div class="buttons">
+          <button id="stream-toggle" class="primary">Start streaming</button>
+          <select id="stream-rate" aria-label="events per second">
+            <option value="20">20 / sec</option>
+            <option value="40" selected>40 / sec</option>
+            <option value="120">120 / sec</option>
+          </select>
+        </div>
+        <p class="note" id="stream-note">
+          Real REES46 events, indexed by the same code the Kafka consumer
+          runs. There is no broker in front of it here: nothing free stays
+          running, so the browser is the source and the local pipeline is the
+          one with Kafka in it.
+        </p>
+        <ol class="ticker" id="ticker"></ol>
+      </div>
+
+      <form class="controls" id="event-form" autocomplete="off">
+        <h3>Index your own event</h3>
+        <label for="ev-title">Title <small>what search will match</small></label>
+        <input id="ev-title" value="Bespoke Widget XR9" maxlength="120" required>
+
+        <div class="pair">
+          <div>
+            <label for="ev-brand">Brand</label>
+            <input id="ev-brand" value="acme" maxlength="60">
+          </div>
+          <div>
+            <label for="ev-price">Price</label>
+            <input id="ev-price" type="number" value="42.50" step="0.01" min="0">
+          </div>
+        </div>
+
+        <div class="pair">
+          <div>
+            <label for="ev-category">Category</label>
+            <input id="ev-category" value="tools.widget" maxlength="80">
+          </div>
+          <div>
+            <label for="ev-type">Event</label>
+            <select id="ev-type">
+              <option>view</option>
+              <option>click</option>
+              <option>search</option>
+              <option>add_to_cart</option>
+              <option>remove_from_cart</option>
+              <option>purchase</option>
+            </select>
+          </div>
+        </div>
+
+        <button type="submit" class="primary">Index it</button>
+        <p class="note" id="event-result"></p>
+      </form>
+    </div>
   </section>
 
   <!-- ────────────────────────── prediction ───────────────────────── -->
@@ -95,7 +182,7 @@
       </div>
 
       <div class="gauge" id="gauge">
-        <div class="gauge-value" id="gauge-value">—</div>
+        <div class="gauge-value" id="gauge-value">-</div>
         <div class="gauge-label" id="gauge-label">no cart yet</div>
         <div class="gauge-track"><div class="gauge-fill" id="gauge-fill"></div></div>
         <dl class="gauge-facts">

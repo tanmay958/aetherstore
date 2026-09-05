@@ -262,13 +262,31 @@ class Coordinator:
         query: str,
         *,
         top_k: int = 10,
+        offset: int = 0,
         mode: str = "and",
         start: int | None = None,
         end: int | None = None,
         global_stats: bool = False,
         scorer: BM25 = DEFAULT_SCORER,
     ) -> QueryResult:
-        """Search every live segment and merge the best results."""
+        """Search every live segment and merge the best results.
+
+        `offset` skips that many of the best hits, which is how a second page
+        is fetched. It is not free, and it is worth being precise about why.
+
+        A distributed index cannot start at rank 50 without first knowing what
+        ranks 1 to 49 are, and no segment knows that alone: any of them might
+        hold the top hit. So page two costs the whole of page one as well.
+        Every engine that fans out has this property, and every one of them
+        caps the depth rather than pretending otherwise.
+
+        The cost is in merging, not in reading. Each segment still returns at
+        most `offset + top_k` hits, and the extra ones are integers being
+        sorted, not documents being fetched. Only the page actually returned
+        is turned into documents.
+        """
+        if offset < 0:
+            raise ValueError(f"offset must not be negative, got {offset}")
         began = time.perf_counter()
         all_segments = self.manifest.segments
         surviving = self.candidates(start, end)
@@ -288,12 +306,14 @@ class Coordinator:
             corpus = self._gather_corpus_stats(surviving, query)
             stats.waves = 2
 
+        # The best `offset + top_k` overall cannot contain more than that many
+        # from any single segment, so that is what each is asked for.
+        depth = offset + top_k
+
         def search_one(segment: SegmentMeta):
             reader = self.reader(segment.key)
-            # top_k per segment, not per index: the best k overall cannot
-            # contain more than k from any one of them.
             return segment.key, reader.search(
-                query, top_k=top_k, mode=mode, scorer=scorer, corpus=corpus
+                query, top_k=depth, mode=mode, scorer=scorer, corpus=corpus
             )
 
         merged: list[GlobalHit] = []
@@ -304,11 +324,11 @@ class Coordinator:
 
         # Ties fall back to segment key then document id, so a repeated query
         # returns the same order regardless of which thread finished first.
-        best = heapq.nsmallest(
-            top_k, merged, key=lambda hit: (-hit.score, hit.segment, hit.doc_id)
+        ranked = heapq.nsmallest(
+            depth, merged, key=lambda hit: (-hit.score, hit.segment, hit.doc_id)
         )
         stats.elapsed_ms = (time.perf_counter() - began) * 1000
-        return QueryResult(best, total, stats)
+        return QueryResult(ranked[offset:], total, stats)
 
     # -- fetching ----------------------------------------------------------
 

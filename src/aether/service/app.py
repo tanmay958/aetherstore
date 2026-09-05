@@ -36,10 +36,11 @@ from __future__ import annotations
 
 import os
 import secrets
+import time
 from typing import Any, Literal
 
 from fastapi import FastAPI, HTTPException, Query, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 from aether.events import EVENT_TYPES
@@ -77,6 +78,16 @@ MAX_TOP_K = 100
 MAX_QUERY_TERMS = 16
 MAX_QUERY_CHARS = 256
 
+# Page two costs page one as well: no segment can start at rank 50 without
+# the merge first establishing what ranks 0 to 49 are. Every engine that fans
+# out has this property and every one of them caps the depth.
+MAX_OFFSET = 500
+
+# Events accepted in one ingest call, and the ceiling on a streaming burst.
+MAX_INGEST_EVENTS = 200
+MAX_STREAM_SECONDS = 50
+MAX_STREAM_RATE = 200
+
 
 # --------------------------------------------------------------------------
 # request and response shapes
@@ -112,6 +123,10 @@ class EventIn(BaseModel):
         event = self.model_dump()
         event["event_id"] = f"http-{index}"
         return event
+
+
+class IngestIn(BaseModel):
+    events: list[EventIn] = Field(min_length=1, max_length=MAX_INGEST_EVENTS)
 
 
 class PredictIn(BaseModel):
@@ -206,6 +221,7 @@ def create_app(state: ServiceState | None = None) -> FastAPI:
             description="the query",
         ),
         k: int = Query(10, ge=1, le=MAX_TOP_K),
+        offset: int = Query(0, ge=0, le=MAX_OFFSET),
         mode: Literal["and", "or"] = "and",
         global_stats: bool = Query(
             False,
@@ -238,7 +254,7 @@ def create_app(state: ServiceState | None = None) -> FastAPI:
 
         def run() -> tuple[Any, list[dict]]:
             result = service.coordinator.search(
-                q, top_k=k, mode=mode, global_stats=global_stats
+                q, top_k=k, offset=offset, mode=mode, global_stats=global_stats
             )
             return result, service.coordinator.documents(result.hits)
 
@@ -253,6 +269,11 @@ def create_app(state: ServiceState | None = None) -> FastAPI:
         body: dict[str, Any] = {
             "query": q,
             "total": result.total,
+            "offset": offset,
+            "limit": k,
+            # Deep paging costs the whole of every earlier page, so the depth
+            # is capped rather than left for a visitor to discover.
+            "max_offset": MAX_OFFSET,
             "took_ms": round(result.stats.elapsed_ms, 1),
             "hits": [
                 {
@@ -276,6 +297,58 @@ def create_app(state: ServiceState | None = None) -> FastAPI:
                         "segments; a cold one pays two requests each",
             }
         return body
+
+    # -- ingest ------------------------------------------------------------
+
+    @app.post("/api/events")
+    def ingest(body: IngestIn) -> dict[str, Any]:
+        """Index events now, and make them searchable before returning.
+
+        The flush and the manifest publish both happen inside this request,
+        and the coordinator is refreshed before it returns, so a caller that
+        posts an event and then searches for it will find it. That is a
+        deliberate choice for a person pressing a button; a stream leaves the
+        flush to the policy, because a segment per event would be absurd.
+        """
+        service = current()
+        if service.ingestor is None:
+            raise HTTPException(
+                503,
+                "this instance is read-only: ingestion needs a writable index "
+                "and a single writer",
+            )
+
+        events = [event.as_event(index) for index, event in enumerate(body.events)]
+        result = service.ingestor.add(events, flush=True)
+        if result.searchable:
+            # Publishing made it durable; refreshing is what makes this
+            # instance able to see it.
+            service.coordinator.refresh()
+        return result.as_dict()
+
+    @app.get("/api/stream")
+    def stream(
+        seconds: float = Query(20.0, gt=0, le=MAX_STREAM_SECONDS),
+        rate: int = Query(40, ge=1, le=MAX_STREAM_RATE),
+    ):
+        """Index real events for a while, reporting progress as it goes.
+
+        Server-sent events rather than a background task, because Cloud Run
+        throttles CPU outside a request: work started and left to finish after
+        the response would stall silently, which is a worse demo than one that
+        is honest about lasting fifty seconds. The page reconnects, so it
+        keeps going while someone is watching and stops when they leave, which
+        is the behaviour a scale-to-zero service wants anyway.
+        """
+        service = current()
+        if service.ingestor is None or service.feed is None:
+            raise HTTPException(503, "no feed configured on this instance")
+
+        return StreamingResponse(
+            _stream_events(service, seconds, rate),
+            media_type="text/event-stream",
+            headers={"cache-control": "no-store", "x-accel-buffering": "no"},
+        )
 
     # -- prediction --------------------------------------------------------
 
@@ -348,11 +421,38 @@ def create_app(state: ServiceState | None = None) -> FastAPI:
     # Mounted last, so every route above wins. A mount at "/" is a catch-all.
     web = _web_root()
     if web is not None:
-        from fastapi.staticfiles import StaticFiles
-
-        app.mount("/", StaticFiles(directory=str(web), html=True), name="web")
+        app.mount("/", _FreshStatic(directory=str(web), html=True), name="web")
 
     return app
+
+
+class _FreshStatic:
+    """Static files that a redeploy actually replaces.
+
+    Starlette sends `etag` and `last-modified` but no `cache-control`, which
+    leaves a browser free to guess, and the usual guess is a fraction of the
+    file's age. That is how a deployed page can keep running yesterday's
+    JavaScript against today's API: the markup was new and the stylesheet was
+    not, and nothing anywhere reported an error.
+
+    A short max-age with revalidation makes the guess unnecessary. The
+    conditional request still costs nothing when the file has not changed,
+    because the etag is already there.
+    """
+
+    def __init__(self, **kwargs) -> None:
+        from fastapi.staticfiles import StaticFiles
+
+        self._inner = StaticFiles(**kwargs)
+
+    async def __call__(self, scope, receive, send) -> None:
+        async def with_cache_header(message):
+            if message["type"] == "http.response.start":
+                headers = message.setdefault("headers", [])
+                headers.append((b"cache-control", b"public, max-age=60, must-revalidate"))
+            await send(message)
+
+        await self._inner(scope, receive, with_cache_header)
 
 
 def _web_root() -> "Path | None":
@@ -373,6 +473,70 @@ def _web_root() -> "Path | None":
         if (candidate / "index.html").is_file():
             return candidate
     return None
+
+
+def _stream_events(service, seconds: float, rate: int):
+    """Pump events from the feed into the index, yielding progress.
+
+    Paced deliberately. The engine indexes tens of thousands a second, and a
+    counter that jumps from nothing to everything shows nothing; a rate a
+    person can watch is the entire point of the panel.
+    """
+    began = time.monotonic()
+    sent = 0
+    batch = max(1, rate // 4)
+    interval = batch / rate
+
+    # `documents` is the whole index, not this partition. The live partition
+    # holds a few thousand of a hundred and forty thousand, and reporting it
+    # as "documents" made the page's own counter fall off a cliff the moment
+    # a burst started.
+    yield _sse("start", {"rate": rate, "seconds": seconds,
+                         "documents": _index_documents(service),
+                         "ingested": service.ingestor.documents})
+    try:
+        while time.monotonic() - began < seconds:
+            events = service.feed.take(batch)
+            if not events:
+                yield _sse("exhausted", {"documents": _index_documents(service)})
+                break
+
+            result = service.ingestor.add(events, flush=False)
+            sent += result.accepted
+            if result.searchable:
+                service.coordinator.refresh()
+
+            yield _sse("progress", {
+                "sent": sent,
+                "buffered": result.buffered,
+                "sealed": result.flushed.key if result.flushed else None,
+                "documents": _index_documents(service),
+                "ingested": service.ingestor.documents,
+                "elapsed": round(time.monotonic() - began, 1),
+            })
+            time.sleep(interval)
+    finally:
+        # Whatever is still buffered would otherwise sit in memory until the
+        # next burst, and an instance that scales to zero would lose it.
+        final = service.ingestor.add([], flush=True)
+        if final.searchable:
+            service.coordinator.refresh()
+        yield _sse("done", {"sent": sent, "documents": _index_documents(service),
+                            "ingested": service.ingestor.documents})
+
+
+def _index_documents(service) -> int:
+    """Documents across every partition, not just the one being written."""
+    try:
+        return service.coordinator.manifest.docs
+    except Exception:  # noqa: BLE001
+        return 0
+
+
+def _sse(event: str, data: dict) -> str:
+    import json as _json
+
+    return f"event: {event}\ndata: {_json.dumps(data)}\n\n"
 
 
 def _why_not(state) -> str:
