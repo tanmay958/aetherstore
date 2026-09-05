@@ -8,8 +8,14 @@ Not a wrapper around Elasticsearch. The segment format, the postings codec, the 
 
 ## Status
 
-**Phase 0 complete**, plus the multi-segment coordinator. Searches a real index
-on Cloudflare R2.
+**Live:** https://aether-441173057461.us-central1.run.app
+
+Searching 100,000 real REES46 events on Cloudflare R2, and scoring sessions
+with a model trained on 10 million of them. Scales to zero, and costs nothing.
+
+```
+curl "https://aether-441173057461.us-central1.run.app/api/search?q=samsung+smartphone&k=3&explain=true"
+```
 
 | Step | | |
 |---|---|---|
@@ -30,6 +36,8 @@ on Cloudflare R2.
 | 4.0 | Compaction and orphan collection | done |
 | 5.0 | Cart-abandonment model, streaming inference | done |
 | 6.0 | HTTP query service, containerised | done |
+| 6.1 | Numpy-only model export, no pickle at serving | done |
+| 8.0 | Deployed to Cloud Run, free tier | done |
 
 Later phases add the bloom filter and skip lists, Kafka and the indexer service, the multi-segment query coordinator, compaction, the ML pipeline, and a dashboard.
 Infrastructure comes last on purpose: the segment format needs none of it, and everything downstream is a caller of it.
@@ -444,6 +452,30 @@ numpy, boto3 and fastapi. Both are close to the floor for this shape.
 The image deliberately excludes the Kafka client too. A container that scales
 to zero cannot be a consumer, so shipping librdkafka would pay tens of
 megabytes for something that can never run there.
+
+### Deployed
+
+Measured on Cloud Run, reading R2 from `us-central1`:
+
+```
+cold start, first request after idle     514 ms
+warm query, terms already cached         297 ms   10 requests
+warm query, new terms                    618 ms   21 requests
+warm query, many matching segments     1,266 ms   40 requests
+```
+
+A warm instance still spends requests, and it should. Only a segment's footer
+and hotcache are cached, and those are what make it openable; a query for a
+term nobody has asked for still reads that term's dictionary block and
+postings. Caching removes the cost of *opening*, paid once, not the cost of
+*reading*, paid per distinct term.
+
+The first request against a cold instance measured 3,453 ms for the same
+query. That is ten segments being opened, and it is the compaction argument
+restated.
+
+Deployment, cost, and the reasoning about what is deliberately not hosted:
+[docs/DEPLOY.md](docs/DEPLOY.md).
 
 ### Two model formats
 
