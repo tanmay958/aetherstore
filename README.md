@@ -27,6 +27,7 @@ on Cloudflare R2.
 | 1.3 | Bloom filter per segment | done |
 | 1.4 | Front-coded term dictionary | done |
 | 1.5 | Bit-packed postings and skip lists | done |
+| 4.0 | Compaction and orphan collection | done |
 
 Later phases add the bloom filter and skip lists, Kafka and the indexer service, the multi-segment query coordinator, compaction, the ML pipeline, and a dashboard.
 Infrastructure comes last on purpose: the segment format needs none of it, and everything downstream is a caller of it.
@@ -60,11 +61,27 @@ QUERIES (warm)               hits  requests       read      ms
 TIME PRUNING "samsung smartphone"
   last hour              10/100 searched     20 requests    22 ms
   everything            100/100 searched    200 requests   225 ms
+
+COMPACTION (merge factor 10)
+                   segments   cold requests   over R2
+  before                100             600      7.5 s
+  after                  10              61      0.8 s
 ```
+
+Cold cost is what a serverless process pays on every invocation, and it is
+driven by how *many* segments there are rather than how big: opening one costs
+two requests before any searching happens. Merging 100 into 10 cuts a cold
+query by **10x**, and answers are identical -- same hits, same document ids,
+same BM25 scores to nine decimal places, verified at a million documents.
 
 Phase 1 took postings from 2.29 to 1.35 bytes each and the whole index from
 0.75x of source to 0.66x. The docstore is now 81% of what remains, and is the
 obvious next target for size.
+
+Compaction never deletes what it retires. A coordinator that read the manifest
+a moment ago is still reading those segments, so removing them is a separate
+job with a grace period -- which is also why the orphan collector had to ship
+in the same phase.
 
 Two of these are worth dwelling on.
 
@@ -325,6 +342,9 @@ src/aether/
     ├── manifest.py    which segments are live: the commit point
     ├── coordinator.py fan out across segments, prune, merge
     ├── ingest.py      CSV -> many segments + manifest
+    ├── compactor.py   merge small segments into larger ones
+    ├── gc.py          delete objects no manifest references
+    ├── compact.py     CLI for both
 └── stream/
     ├── config.py      Kafka connection settings
     ├── producer.py    CSV -> Kafka, keyed by session

@@ -47,6 +47,20 @@ def human(n: float) -> str:
     return f"{n:,.1f} TB"
 
 
+def _cold_cost(store: LocalStore, query: str) -> int:
+    """Requests a freshly started process pays to answer one query.
+
+    A new coordinator every time, because the whole point is the state a
+    serverless invocation starts in: nothing cached, every segment to open.
+    """
+    counting = CountingStore(store)
+    coordinator = Coordinator(counting, max_workers=16)
+    for meta in coordinator.manifest.segments:
+        coordinator.reader(meta.key)
+    coordinator.search(query, top_k=10)
+    return counting.stats.requests
+
+
 def measure_index(store: LocalStore) -> dict:
     manifest = read_manifest(store)
     sections = dict(postings=0, docstore=0, termdict=0, hotcache=0, footer=0)
@@ -174,6 +188,35 @@ def main(argv: list[str] | None = None) -> int:
         saved = f"{100 * skipped / without:.0f}%" if without else "-"
         print(f"  {label:<22} {result.total:>10,} {fresh.stats.requests:>9,} "
               f"{without:>9,} {saved:>7} {elapsed:>7,.0f}")
+
+    # -- compaction ---------------------------------------------------------
+
+    # Cold cost is what a serverless process pays on every invocation, and it
+    # is dominated by how many segments there are rather than how big they
+    # are, because opening each one costs two requests before any searching
+    # happens.
+    print(f"\nCOMPACTION")
+    before_segments = len(manifest.segments)
+    before_cold = _cold_cost(store, "samsung smartphone")
+
+    from aether.index.compactor import compact as run_compaction
+
+    outcome = run_compaction(store, merge_factor=10)
+    after = read_manifest(store)
+    after_cold = _cold_cost(store, "samsung smartphone")
+
+    print(f"  {outcome}")
+    print(f"  {'':<20}{'segments':>10}{'cold requests':>15}{'over R2':>10}")
+    for label, count, requests in (
+        ("before", before_segments, before_cold),
+        ("after", len(after.segments), after_cold),
+    ):
+        # 200 ms a request measured against R2 from a laptop, 16 concurrent.
+        print(f"  {label:<20}{count:>10}{requests:>15,}{requests / 16 * 0.2:>9.1f}s")
+    print(
+        "  sources retired but not deleted; the collector removes them once "
+        "no in-flight reader can still be holding the old manifest"
+    )
 
     # -- pruning -----------------------------------------------------------
 

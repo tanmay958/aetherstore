@@ -31,7 +31,7 @@ so real AWS keeps its defaults and its upload integrity checks.
 from __future__ import annotations
 
 import os
-from typing import Any
+from typing import Any, Iterator
 
 from aether.storage.base import ObjectStore
 
@@ -191,17 +191,33 @@ class S3Store(ObjectStore):
         # a retrying caller needs.
         self._client.delete_object(Bucket=self.bucket, Key=self._key(key))
 
-    def size(self, key: str) -> int:
+    def list_keys(self, prefix: str = "") -> Iterator[str]:
+        # Paginated, because a bucket can hold more objects than one response
+        # carries and a truncated listing would make the collector think
+        # everything past the first page is unreferenced.
+        paginator = self._client.get_paginator("list_objects_v2")
+        full_prefix = self._key(prefix) if prefix else self.prefix
+        strip = len(self.prefix) + 1 if self.prefix else 0
+        for page in paginator.paginate(Bucket=self.bucket, Prefix=full_prefix):
+            for entry in page.get("Contents", []):
+                yield entry["Key"][strip:]
+
+    def _head(self, key: str) -> dict:
         from botocore.exceptions import ClientError
 
         try:
-            head = self._client.head_object(Bucket=self.bucket, Key=self._key(key))
+            return self._client.head_object(Bucket=self.bucket, Key=self._key(key))
         except ClientError as exc:
             code = str(exc.response.get("Error", {}).get("Code", ""))
             if code in _NOT_FOUND:
                 raise FileNotFoundError(f"{self.bucket}/{self._key(key)}") from exc
             raise
-        return head["ContentLength"]
+
+    def modified_at(self, key: str) -> float:
+        return self._head(key)["LastModified"].timestamp()
+
+    def size(self, key: str) -> int:
+        return self._head(key)["ContentLength"]
 
     def exists(self, key: str) -> bool:
         try:

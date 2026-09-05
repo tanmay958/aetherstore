@@ -35,6 +35,12 @@ class CrashAfter(ObjectStore):
     def delete(self, key: str) -> None:
         self.inner.delete(key)
 
+    def list_keys(self, prefix: str = ""):
+        return self.inner.list_keys(prefix)
+
+    def modified_at(self, key: str) -> float:
+        return self.inner.modified_at(key)
+
     def size(self, key: str) -> int:
         return self.inner.size(key)
 

@@ -22,6 +22,7 @@ extra round trip.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from typing import Iterator
 
 
 class ObjectStore(ABC):
@@ -52,6 +53,31 @@ class ObjectStore(ABC):
 
         There is no append and no partial update, because object storage
         offers neither. That constraint is why segments are immutable.
+        """
+
+    @abstractmethod
+    def list_keys(self, prefix: str = "") -> Iterator[str]:
+        """Every key under a prefix.
+
+        Listing is avoided everywhere else in this engine, and the manifest
+        exists precisely so that queries never need it: it is slow, it costs a
+        request per page, and it can return objects that are still being
+        uploaded.
+
+        Garbage collection is the one job that genuinely requires it. An
+        object no manifest mentions is invisible by definition, so the
+        manifest cannot be used to find it, and something has to look at what
+        is actually there.
+        """
+
+    @abstractmethod
+    def modified_at(self, key: str) -> float:
+        """When an object was last written, in epoch seconds.
+
+        Used only by the collector, to leave recent objects alone. An object
+        can be unreferenced because it is genuinely dead, or because an
+        indexer wrote it moments ago and has not published its manifest yet,
+        and age is what tells those apart.
         """
 
     @abstractmethod

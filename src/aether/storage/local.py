@@ -10,6 +10,7 @@ request count is the number that transfers to real object storage.
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Iterator
 
 from aether.storage.base import ObjectStore
 
@@ -50,6 +51,22 @@ class LocalStore(ObjectStore):
 
     def delete(self, key: str) -> None:
         self._path(key).unlink(missing_ok=True)
+
+    def list_keys(self, prefix: str = "") -> Iterator[str]:
+        root = self.root.resolve()
+        if not root.is_dir():
+            return
+        for path in sorted(root.rglob("*")):
+            if not path.is_file():
+                continue
+            # Keys are posix-style relative paths, so a listing produced here
+            # is interchangeable with one produced by S3.
+            key = path.relative_to(root).as_posix()
+            if key.startswith(prefix):
+                yield key
+
+    def modified_at(self, key: str) -> float:
+        return self._path(key).stat().st_mtime
 
     def size(self, key: str) -> int:
         return self._path(key).stat().st_size
