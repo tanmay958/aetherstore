@@ -405,3 +405,53 @@ def test_the_worst_accepted_query_has_bounded_cost(indexed):
     # the documents, and nothing beyond it.
     ceiling = 2 * MAX_QUERY_TERMS * segments + 4 * segments
     assert spent <= ceiling, f"{spent} requests exceeds the {ceiling} ceiling"
+
+
+# --------------------------------------------------------------------------
+# the shared secret in front of the API
+# --------------------------------------------------------------------------
+
+
+@pytest.fixture
+def locked(monkeypatch, indexed):
+    """A service configured with a key, as it runs behind the Pages proxy."""
+    from aether.service.app import API_KEY_ENV
+
+    monkeypatch.setenv(API_KEY_ENV, "correct-horse")
+    state = ServiceState(indexed, model_uri=None)
+    state.load()
+    return TestClient(create_app(state))
+
+
+def test_without_a_key_the_api_is_open(client):
+    """The default. The data is a public dataset, and what needed defending
+    was the bill, which the query caps handle."""
+    assert client.get("/api/search?q=samsung").status_code == 200
+
+
+def test_a_configured_key_is_required(locked):
+    assert locked.get("/api/search?q=samsung").status_code == 401
+    assert locked.get("/api/index").status_code == 401
+    assert locked.post("/api/predict", json={"events": session_events()}).status_code == 401
+
+
+def test_the_right_key_gets_through(locked):
+    from aether.service.app import API_KEY_HEADER
+
+    response = locked.get("/api/search?q=samsung", headers={API_KEY_HEADER: "correct-horse"})
+    assert response.status_code == 200
+
+
+def test_a_wrong_key_is_refused(locked):
+    from aether.service.app import API_KEY_HEADER
+
+    for wrong in ("", "correct-hors", "correct-horsey", "CORRECT-HORSE"):
+        assert locked.get(
+            "/api/search?q=samsung", headers={API_KEY_HEADER: wrong}
+        ).status_code == 401
+
+
+def test_health_stays_reachable_without_a_key(locked):
+    """An uptime check should not need a credential, and /health discloses
+    nothing but whether the index and model loaded."""
+    assert locked.get("/health").status_code == 200

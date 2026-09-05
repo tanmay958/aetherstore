@@ -34,14 +34,29 @@ there is a test asserting the two paths agree.
 
 from __future__ import annotations
 
+import os
+import secrets
 from typing import Any, Literal
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from aether.events import EVENT_TYPES
 from aether.index.analyzer import tokenize
 from aether.service.state import ServiceState, state_from_env
+
+# When set, every /api/* request must carry this in `x-aether-key`. It is
+# held by the Cloudflare Pages Function in front of the service, never by the
+# page, because anything the page knows is in the visitor's network tab.
+#
+# Unset means open, which is the honest default for a demo whose data is a
+# public dataset: the thing worth protecting here is the bill, and that is
+# what the query caps below do. This closes the door on casual scripted abuse
+# once the proxy is in place; it is a shared secret, not an identity, and it
+# does not pretend to be one.
+API_KEY_ENV = "AETHER_API_KEY"
+API_KEY_HEADER = "x-aether-key"
 
 MAX_EVENTS_PER_REQUEST = 500
 MAX_TOP_K = 100
@@ -124,6 +139,23 @@ def create_app(state: ServiceState | None = None) -> FastAPI:
         description="Distributed search and streaming prediction, from scratch.",
         version="0.1.0",
     )
+
+    expected_key = os.environ.get(API_KEY_ENV) or None
+
+    @app.middleware("http")
+    async def require_key(request: Request, call_next):
+        """Gate /api/* on a shared secret, when one is configured.
+
+        `/health` is deliberately outside the gate: an uptime check should not
+        need a credential, and it discloses nothing but whether the index and
+        model loaded.
+        """
+        if expected_key and request.url.path.startswith("/api/"):
+            offered = request.headers.get(API_KEY_HEADER, "")
+            # Constant time, so a mismatch cannot be found one byte at a time.
+            if not secrets.compare_digest(offered, expected_key):
+                return JSONResponse({"detail": "not authorised"}, status_code=401)
+        return await call_next(request)
 
     resolved: dict[str, ServiceState] = {}
 

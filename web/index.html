@@ -1,0 +1,172 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AetherStore</title>
+<meta name="description" content="A distributed search and streaming prediction engine, built from scratch.">
+<link rel="stylesheet" href="./style.css">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><text y='26' font-size='26'>◆</text></svg>">
+</head>
+<body>
+
+<header class="masthead">
+  <div class="wrap">
+    <div class="brand">
+      <span class="mark">◆</span>
+      <div>
+        <h1>AetherStore</h1>
+        <p>A distributed search and streaming prediction engine, written from scratch in Python and numpy.</p>
+      </div>
+    </div>
+    <dl class="facts" id="facts">
+      <div><dt>documents</dt><dd id="fact-docs">·</dd></div>
+      <div><dt>segments</dt><dd id="fact-segments">·</dd></div>
+      <div><dt>index size</dt><dd id="fact-bytes">·</dd></div>
+      <div><dt>model</dt><dd id="fact-model">·</dd></div>
+    </dl>
+  </div>
+</header>
+
+<nav class="tabs wrap" role="tablist">
+  <button role="tab" aria-selected="true"  data-panel="search">Search</button>
+  <button role="tab" aria-selected="false" data-panel="predict">Prediction</button>
+  <button role="tab" aria-selected="false" data-panel="about">How it works</button>
+</nav>
+
+<main class="wrap">
+
+  <!-- ─────────────────────────── search ─────────────────────────── -->
+  <section id="panel-search" class="panel">
+    <form id="search-form" class="searchbar" autocomplete="off">
+      <input id="q" name="q" type="search" placeholder="samsung smartphone" value="samsung smartphone"
+             maxlength="256" aria-label="search query" spellcheck="false">
+      <select id="mode" aria-label="match mode">
+        <option value="and">all terms</option>
+        <option value="or">any term</option>
+      </select>
+      <button type="submit">Search</button>
+    </form>
+
+    <p class="hint">
+      Real REES46 e-commerce events, held in immutable segments on Cloudflare R2 and
+      read over HTTP range requests. Nothing is cached server-side except segment
+      headers, so the cost below is what the query genuinely spent.
+    </p>
+
+    <div class="cost" id="cost" hidden>
+      <div class="cost-figure"><span id="cost-took">·</span><small>elapsed</small></div>
+      <div class="cost-figure"><span id="cost-requests">·</span><small>storage requests</small></div>
+      <div class="cost-figure"><span id="cost-bytes">·</span><small>bytes read</small></div>
+      <div class="cost-figure"><span id="cost-segments">·</span><small>segments searched</small></div>
+      <div class="cost-figure"><span id="cost-pruned">·</span><small>pruned, for free</small></div>
+    </div>
+
+    <p class="status" id="search-status"></p>
+    <ol class="results" id="results"></ol>
+  </section>
+
+  <!-- ────────────────────────── prediction ───────────────────────── -->
+  <section id="panel-predict" class="panel" hidden>
+    <p class="hint">
+      Build a shopping session and watch the model decide. Every event is scored by
+      the same code the Kafka replicas run, against a gradient boosting model
+      trained on 10 million real events. Nothing is scored until something is in a
+      cart, because a session with an empty cart cannot abandon one.
+    </p>
+
+    <div class="predict-grid">
+      <div class="controls">
+        <label for="product">Product</label>
+        <select id="product"></select>
+
+        <div class="buttons">
+          <button data-event="view">View</button>
+          <button data-event="add_to_cart" class="primary">Add to cart</button>
+          <button data-event="remove_from_cart">Remove</button>
+          <button data-event="purchase" class="good">Purchase</button>
+        </div>
+        <div class="buttons">
+          <button data-wait="300">Wait 5 min</button>
+          <button data-wait="1800">Wait 30 min</button>
+          <button id="reset" class="ghost">Reset</button>
+        </div>
+        <p class="note" id="predict-note">A purchase settles the cart, not the session: real shoppers buy and keep going.</p>
+      </div>
+
+      <div class="gauge" id="gauge">
+        <div class="gauge-value" id="gauge-value">—</div>
+        <div class="gauge-label" id="gauge-label">no cart yet</div>
+        <div class="gauge-track"><div class="gauge-fill" id="gauge-fill"></div></div>
+        <dl class="gauge-facts">
+          <div><dt>events</dt><dd id="g-events">0</dd></div>
+          <div><dt>cart</dt><dd id="g-cart">0</dd></div>
+          <div><dt>value</dt><dd id="g-value">$0</dd></div>
+        </dl>
+      </div>
+    </div>
+
+    <ol class="timeline" id="timeline"></ol>
+  </section>
+
+  <!-- ─────────────────────────── about ──────────────────────────── -->
+  <section id="panel-about" class="panel" hidden>
+    <div class="prose">
+      <h2>What this is</h2>
+      <p>
+        An inverted index, a segment format, a query coordinator, a Kafka indexer, a
+        compactor and a streaming prediction pipeline, none of which use a search or
+        serving library. The only runtime dependency of the engine is numpy.
+      </p>
+
+      <h2>Why a query costs what it costs</h2>
+      <p>
+        Documents live in immutable segments in object storage. Opening one costs two
+        range reads, for a footer and a small header block, and both are cached
+        forever because a segment can never change. After that, each distinct term
+        costs a dictionary read and a postings read per segment that survives
+        pruning.
+      </p>
+      <p>
+        That is why a warm instance still spends requests, and why it should: caching
+        removes the cost of <em>opening</em>, paid once, not the cost of
+        <em>reading</em>, paid per term. It is also why the index is compacted.
+        Merging 100 segments into 10 took a cold query from 124 requests to 15.
+      </p>
+
+      <h2>Why prediction needs no coordination</h2>
+      <p>
+        Events are published to Kafka keyed by session id, so every event for a
+        session lands on one partition, and Kafka gives each partition to exactly one
+        consumer in a group. One replica therefore sees a session's whole history and
+        can hold its state in a plain dictionary: no Redis, no locks, no consensus.
+        Single-writer safety was inherited from the log rather than built.
+      </p>
+      <p>
+        Take the key away and it collapses. Events round-robin, every replica sees a
+        fragment of every session, and the state has to move somewhere shared.
+      </p>
+
+      <h2>Where things run</h2>
+      <p>
+        This page is on Cloudflare Pages. The API is on Cloud Run, which scales to
+        zero, so the first request after an idle period pays about half a second to
+        start. The index and the model are on Cloudflare R2. The three-replica
+        streaming predictor and its broker stay on a laptop, because a consumer that
+        scales to zero does not idle cheaply, it falls behind.
+      </p>
+      <p class="repo">
+        <a href="https://github.com/tanmay958/aetherstore">Source on GitHub</a>
+      </p>
+    </div>
+  </section>
+
+</main>
+
+<footer class="wrap">
+  <p>Data: <a href="https://www.kaggle.com/datasets/mkechinov/ecommerce-behavior-data-from-multi-category-store">REES46 eCommerce behaviour</a>. Product titles are derived deterministically from product ids; brands, categories and prices are real.</p>
+</footer>
+
+<script src="./app.js"></script>
+</body>
+</html>

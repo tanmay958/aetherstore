@@ -38,6 +38,8 @@ curl "https://aether-441173057461.us-central1.run.app/api/search?q=samsung+smart
 | 6.0 | HTTP query service, containerised | done |
 | 6.1 | Numpy-only model export, no pickle at serving | done |
 | 8.0 | Deployed to Cloud Run, free tier | done |
+| 6.2 | Query cost caps, shared-secret gate | done |
+| 7.0 | Dashboard on Cloudflare Pages | done |
 
 Later phases add the bloom filter and skip lists, Kafka and the indexer service, the multi-segment query coordinator, compaction, the ML pipeline, and a dashboard.
 Infrastructure comes last on purpose: the segment format needs none of it, and everything downstream is a caller of it.
@@ -547,3 +549,39 @@ docs/DATA.md           dataset, attribution, and what is real vs derived
 REES46 public clickstream, ~285M events. Attribution, download steps, schema, and the precise boundary between real and derived fields are in [docs/DATA.md](docs/DATA.md).
 
 No raw rows from the dataset are committed here; it is not under an open redistribution licence. The test fixture is hand-authored in the REES46 schema.
+
+## The dashboard
+
+`web/` is a static page and one Cloudflare Pages Function. No framework, no
+build step: what is written is what is served.
+
+The search panel shows what each query cost in storage requests and bytes,
+which is the only way the engine underneath is visible at all. A results list
+looks the same whether it came from this or from a library.
+
+The prediction panel builds a session event by event and scores it against the
+deployed model. Time only advances when you press "wait", because idle time is
+one of the features and letting wall clock drive it would make the demo
+unreproducible.
+
+```
+python3 web/dev-server.py      # serves web/ and proxies /api/* to Cloud Run
+```
+
+That proxy is not a convenience. In production the page and the API share an
+origin, which is what lets the API key live in the Pages Function rather than
+in the browser. Opening `index.html` straight against Cloud Run is two
+origins, so the browser asks for CORS and is refused. Adding CORS to the
+service to make local development easier would weaken the same-origin property
+the deployment relies on, to fix a problem that only exists on a laptop.
+
+### Why the key is in the Function and not the page
+
+A browser cannot keep a secret: anything the page holds is in the network tab.
+CORS does not help either, since browsers enforce it and `curl` ignores it. So
+the secret lives at the edge, where the visitor cannot read it, and the page
+calls its own origin.
+
+`AETHER_API_KEY` is unset by default, which leaves the API open. That is the
+honest default for a demo over a public dataset, and it is why the query caps
+matter more than the gate: what needed defending was the bill.
