@@ -1,0 +1,12 @@
+# The raw dataset is a build input, never a deployment artifact. Without this
+# the build context is 14.7 GB.
+data/
+.venv/
+.git/
+.github/
+tests/
+docs/
+__pycache__/
+*.pyc
+.env
+learnt.txt

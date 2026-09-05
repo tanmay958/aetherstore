@@ -17,9 +17,15 @@ stream = [
 ml = [
     "scikit-learn>=1.5",
 ]
+# The HTTP query service. Kept optional so the engine and its tests still
+# install with nothing but numpy.
+service = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.30",
+]
 
 [dependency-groups]
-dev = ["pytest>=8.0", "boto3>=1.34"]
+dev = ["pytest>=8.0", "boto3>=1.34", "fastapi>=0.115", "httpx>=0.27"]
 
 [build-system]
 requires = ["hatchling"]

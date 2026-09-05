@@ -12,6 +12,7 @@ rebalancing behave the way the design assumes.
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import socket
 import uuid
@@ -39,9 +40,24 @@ def _reachable() -> bool:
     return True
 
 
+def _has_client() -> bool:
+    """A reachable broker is not enough: the client is an optional extra.
+
+    Gating on the broker alone meant that installing without `--extra stream`
+    turned these into four hard failures rather than four skips, which is a
+    misleading way to report a dependency that the suite deliberately treats
+    as optional.
+    """
+    return importlib.util.find_spec("confluent_kafka") is not None
+
+
 pytestmark = [
     pytest.mark.integration,
     pytest.mark.skipif(not _reachable(), reason="Redpanda not running; try `make up`"),
+    pytest.mark.skipif(
+        not _has_client(),
+        reason="confluent-kafka not installed; try `uv sync --extra stream`",
+    ),
 ]
 
 

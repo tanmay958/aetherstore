@@ -28,6 +28,8 @@ on Cloudflare R2.
 | 1.4 | Front-coded term dictionary | done |
 | 1.5 | Bit-packed postings and skip lists | done |
 | 4.0 | Compaction and orphan collection | done |
+| 5.0 | Cart-abandonment model, streaming inference | done |
+| 6.0 | HTTP query service, containerised | done |
 
 Later phases add the bloom filter and skip lists, Kafka and the indexer service, the multi-segment query coordinator, compaction, the ML pipeline, and a dashboard.
 Infrastructure comes last on purpose: the segment format needs none of it, and everything downstream is a caller of it.
@@ -349,11 +351,87 @@ uv run python -m aether.index.search      r2://aether/segments/0.seg "samsung sm
 To work with real data, see [docs/DATA.md](docs/DATA.md).
 For MinIO, R2, and S3 setup, see [docs/STORAGE.md](docs/STORAGE.md).
 
+## The service
+
+One process serves both halves of the project, because both are stateless
+reads of an artifact in a bucket and the same dashboard wants both.
+
+```
+uv run python -m aether.service --index r2://aether/idx100k --model r2://aether/models/model.pkl
+```
+
+| | |
+|---|---|
+| `GET /health` | index and model, and which of them is degraded |
+| `GET /api/search?q=&k=&mode=&global_stats=&explain=` | ranked documents |
+| `POST /api/predict` | P(abandon) after each event of a session |
+| `GET /api/index`, `GET /api/model` | manifest summary, model card |
+
+Against the 100,000-document index on R2:
+
+```
+cold    246 ms   10 requests, 2.9 KB
+warm    0.5 ms    0 requests
+```
+
+The warm figure is not a cache of answers. A segment's footer and hotcache are
+read once and held for the life of the process, and they can never go stale
+because a segment is immutable. Publishing new data writes a new segment and a
+new manifest, so nothing has to be invalidated.
+
+`?explain=1` reports exactly what a query spent. It takes a lock, because the
+read counters are shared and concurrent requests would otherwise land in each
+other's totals, so it is opt-in and off the default path. Measurement should
+not shape the code it measures.
+
+### Prediction over HTTP
+
+`/api/predict` returns the whole trajectory rather than one number, because
+what is interesting about this model is how the probability moves:
+
+```
+0  view                              P(abandon) = -
+1  view                              P(abandon) = -
+2  add_to_cart   cart $1206.45       P(abandon) = 0.5354
+3  view          +310s idle          P(abandon) = 0.7479
+4  view          +800s idle          P(abandon) = 0.8494
+```
+
+The endpoint drives `Predictor.handle`, the same function the Kafka replicas
+run, rather than reimplementing scoring for HTTP. A test asserts the two paths
+produce identical probabilities, because a second implementation here is
+exactly how train/serve skew gets in.
+
+### Cold start
+
+Measured in the container, against R2:
+
+```
+load index + model from R2   1,433 ms
+import scikit-learn            783 ms
+numpy, boto3, fastapi          496 ms
+                             -------
+                             2,718 ms
+```
+
+That is the number a scale-to-zero deployment pays on its first request.
+scikit-learn is 783 ms of it and most of the 693 MB image, for a gradient
+boosting model that is ultimately a pile of thresholds; exporting it to a
+numpy-only scorer is the obvious next cut and is not done yet.
+
+The image deliberately excludes the Kafka client. A container that scales to
+zero cannot be a consumer, so shipping librdkafka would pay tens of megabytes
+for something that can never run there.
+
 ## Layout
 
 ```
 src/aether/
 ├── events.py          canonical event schema, the boundary everything targets
+├── service/
+│   ├── app.py         FastAPI: /api/search, /api/predict, /health
+│   ├── state.py       index and model, loaded once per process
+│   └── main.py        uvicorn entry point, PORT-aware for Cloud Run
 ├── data/
 │   ├── rees46.py      streaming CSV -> canonical events (.csv and .csv.gz)
 │   ├── titles.py      deterministic product titles derived from product_id
