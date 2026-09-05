@@ -40,10 +40,26 @@ from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel, Field
 
 from aether.events import EVENT_TYPES
+from aether.index.analyzer import tokenize
 from aether.service.state import ServiceState, state_from_env
 
 MAX_EVENTS_PER_REQUEST = 500
 MAX_TOP_K = 100
+
+# A query costs roughly one dictionary read plus one postings read per term
+# per segment, so its cost is linear in the number of terms and there is no
+# natural ceiling on how many a caller can send. Measured against the
+# 1,000,000-document index: one term cost 100 object storage requests, and 267
+# terms cost 27,115. That is a 271x amplification of one cheap HTTP request
+# into someone else's storage bill, and roughly 370 such requests would exhaust
+# a month of R2's free tier.
+#
+# Nobody searches for sixteen words. This is not a limit real use will reach,
+# and it is what keeps the cost of a request bounded by the request rather than
+# by its contents. Rate limiting belongs at the edge; this belongs here,
+# because it is a property of the engine and not of the deployment.
+MAX_QUERY_TERMS = 16
+MAX_QUERY_CHARS = 256
 
 
 # --------------------------------------------------------------------------
@@ -149,7 +165,11 @@ def create_app(state: ServiceState | None = None) -> FastAPI:
 
     @app.get("/api/search")
     def search(
-        q: str = Query(min_length=1, description="the query"),
+        q: str = Query(
+            min_length=1,
+            max_length=MAX_QUERY_CHARS,
+            description="the query",
+        ),
         k: int = Query(10, ge=1, le=MAX_TOP_K),
         mode: Literal["and", "or"] = "and",
         global_stats: bool = Query(
@@ -164,6 +184,18 @@ def create_app(state: ServiceState | None = None) -> FastAPI:
         service = current()
         if not service.ready:
             raise HTTPException(503, f"index unavailable: {service.index_error}")
+
+        # Counted after analysis, because that is what the engine will
+        # actually go and read. Counting the raw string would let punctuation
+        # and stopwords through, and would reject queries that cost nothing.
+        terms = tokenize(q)
+        if len(terms) > MAX_QUERY_TERMS:
+            raise HTTPException(
+                422,
+                f"{len(terms)} search terms exceeds the {MAX_QUERY_TERMS} "
+                "allowed: each term costs a read in every segment, so an "
+                "unbounded query is an unbounded bill",
+            )
 
         def run() -> tuple[Any, list[dict]]:
             result = service.coordinator.search(

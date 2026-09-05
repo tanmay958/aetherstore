@@ -327,3 +327,81 @@ def test_the_model_card_says_which_format_was_loaded(client, model):
     numpy export or dragging scikit-learn in behind a pickle."""
     body = client.get("/api/model").json()
     assert body["format"] == ("numpy" if model.suffix == ".npz" else "pickle")
+
+
+# --------------------------------------------------------------------------
+# a request must not be able to cost an unbounded amount
+# --------------------------------------------------------------------------
+
+
+def test_too_many_search_terms_are_rejected(client):
+    """One HTTP request used to buy 27,115 object storage requests against the
+    1M index, because cost is linear in term count and nothing capped it."""
+    from aether.service.app import MAX_QUERY_TERMS
+
+    ok = " ".join(f"term{n}" for n in range(MAX_QUERY_TERMS))
+    too_many = " ".join(f"term{n}" for n in range(MAX_QUERY_TERMS + 1))
+    assert client.get(f"/api/search?q={ok}").status_code == 200
+    response = client.get(f"/api/search?q={too_many}")
+    assert response.status_code == 422
+    assert "exceeds" in response.json()["detail"]
+
+
+def test_an_overlong_query_string_is_rejected(client):
+    from aether.service.app import MAX_QUERY_CHARS
+
+    assert client.get("/api/search?q=" + "a" * (MAX_QUERY_CHARS + 1)).status_code == 422
+
+
+def test_punctuation_does_not_count_against_the_term_limit(client):
+    """The limit is on what the engine will read, not on what was typed."""
+    from aether.service.app import MAX_QUERY_TERMS
+
+    noisy = " , . ".join(f"term{n}" for n in range(MAX_QUERY_TERMS))
+    assert client.get(f"/api/search?q={noisy}").status_code == 200
+
+
+def test_the_worst_accepted_query_has_bounded_cost(indexed):
+    """The property the limit exists for.
+
+    Rejecting long queries is only worth anything if what remains is actually
+    bounded, so this measures the most expensive query the endpoint will now
+    accept and pins the ceiling. If someone raises the term limit without
+    thinking about storage cost, this is what fails.
+    """
+    from aether.index.analyzer import tokenize
+    from aether.service.app import MAX_QUERY_TERMS
+    from aether.storage import CountingStore
+
+    counting = CountingStore(indexed)
+    state = ServiceState(counting, model_uri=None)
+    state.load()
+    local = TestClient(create_app(state))
+
+    # Real terms, harvested from the index, because terms that are absent are
+    # rejected by the bloom filter and cost almost nothing. The expensive
+    # query is the one where every term is really there.
+    from aether.index.coordinator import Coordinator
+
+    reader = Coordinator(indexed)
+    vocabulary: list[str] = []
+    for segment in reader.manifest.segments:
+        opened = reader.reader(segment.key)
+        for doc_id in range(min(8, segment.docs)):
+            vocabulary += tokenize(opened.document(doc_id).get("title") or "")
+    vocabulary = list(dict.fromkeys(vocabulary))[:MAX_QUERY_TERMS]
+    assert len(vocabulary) >= 4, "fixture should yield several real terms"
+
+    local.get("/api/search?q=samsung")  # warm the footers
+    before = counting.stats.requests
+    assert local.get(
+        "/api/search?q=" + "+".join(vocabulary) + "&mode=or&k=100"
+    ).status_code == 200
+    spent = counting.stats.requests - before
+
+    segments = len(reader.manifest.segments)
+    # Two reads per term per segment is the shape of the work: a dictionary
+    # block and a postings block. The ceiling allows for that plus fetching
+    # the documents, and nothing beyond it.
+    ceiling = 2 * MAX_QUERY_TERMS * segments + 4 * segments
+    assert spent <= ceiling, f"{spent} requests exceeds the {ceiling} ceiling"

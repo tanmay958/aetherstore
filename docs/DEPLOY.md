@@ -156,3 +156,63 @@ gcloud run deploy aether --image=$REGION-docker.pkg.dev/$PROJECT/aether/service:
 
 Publishing new data needs no deployment at all.
 The service reads the manifest at start-up, so a new segment becomes visible to the next cold instance, and `Coordinator.refresh` picks it up in a warm one.
+
+## Exposure
+
+The service is public and unauthenticated, and its URL is in this repository.
+Treat the URL as known.
+
+Most of what is reachable does not matter: REES46 is a public dataset, the documents are product views, and the model card is metrics.
+What matters is what a request can be made to *cost*.
+
+### Cost per request is capped, because it was not
+
+A query costs roughly one dictionary read and one postings read per term per segment.
+That is linear in the number of terms, and nothing capped the number of terms.
+Measured against the 1,000,000-document index:
+
+```
+  1 real term    ->    100 storage requests
+ 10 real terms   ->  1,734
+ 50 real terms   ->  6,355
+267 real terms   -> 27,115      271x amplification
+```
+
+R2's free tier is 10M class B operations a month, so roughly 370 crafted HTTP requests would have exhausted a month of it, and billing is enabled, so the overage is a charge rather than a stop.
+
+`MAX_QUERY_TERMS = 16` and `MAX_QUERY_CHARS = 256` bound it.
+Nobody searches for sixteen words, so this is not a limit real use reaches.
+A rejected query costs zero storage requests, because it is rejected before the coordinator is asked for anything.
+
+There is a test, `test_the_worst_accepted_query_has_bounded_cost`, that measures the most expensive query the endpoint still accepts and pins a ceiling on it.
+Rejecting long queries is only worth something if what remains is genuinely bounded, and that is the property worth defending rather than the limit itself.
+
+`k` and the event count on `/api/predict` are capped for the same reason.
+
+### What this does not solve
+
+**Aggregate abuse.** The cap bounds what one request costs. It does nothing about ten thousand of them.
+Rate limiting is the answer and it belongs at the edge, not in this process, because a Cloud Run service scaled across instances cannot count requests coherently anyway.
+
+**Authentication.** There is none. A browser cannot hold a secret: anything the frontend sends is in the network tab.
+CORS does not help either, since it is enforced by browsers and ignored by `curl`.
+
+The pattern that does work is a server-side proxy:
+
+```
+browser -> Cloudflare Pages -> /api/* Pages Function -> Cloud Run
+                               (holds the secret)      (rejects without it)
+```
+
+The frontend calls its own origin, and the shared secret lives in the Function where a visitor cannot read it.
+The stronger form makes Cloud Run private with `--no-allow-unauthenticated` and has the Function present a Google identity token, so anonymous traffic is rejected by Google before a container is even started, and therefore costs nothing at all.
+
+### Least privilege, still outstanding
+
+The deployed service holds R2 credentials that can **write** to the bucket, and it only ever reads.
+They should be a read-only R2 API token, so that a compromise of the container cannot overwrite the index or the model.
+This is a Cloudflare dashboard action followed by updating the three secrets.
+
+### Worth setting
+
+A billing budget alert on the GCP project, so that an unexpected charge arrives as a notification rather than as an invoice.
