@@ -455,3 +455,33 @@ def test_health_stays_reachable_without_a_key(locked):
     """An uptime check should not need a credential, and /health discloses
     nothing but whether the index and model loaded."""
     assert locked.get("/health").status_code == 200
+
+
+# --------------------------------------------------------------------------
+# the dashboard, served by the same process
+# --------------------------------------------------------------------------
+
+
+def test_the_dashboard_is_served_at_the_root(client):
+    """Same origin as the API, which is what removes the need for CORS."""
+    response = client.get("/")
+    assert response.status_code == 200
+    assert "AetherStore" in response.text
+
+
+def test_the_dashboard_does_not_shadow_the_api(client):
+    """A mount at "/" is a catch-all, so it must be added after every route."""
+    assert client.get("/api/search?q=samsung").status_code == 200
+    assert client.get("/health").json()["status"] == "ok"
+
+
+def test_a_missing_dashboard_is_not_fatal(monkeypatch, indexed, tmp_path):
+    """The API is the product; the page is a convenience on top of it."""
+    from aether.service.app import WEB_ROOT_ENV
+
+    monkeypatch.setenv(WEB_ROOT_ENV, str(tmp_path / "absent"))
+    state = ServiceState(indexed, model_uri=None)
+    state.load()
+    bare = TestClient(create_app(state))
+    assert bare.get("/api/search?q=samsung").status_code == 200
+    assert bare.get("/").status_code == 404

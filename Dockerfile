@@ -35,8 +35,14 @@ ENV PYTHONUNBUFFERED=1 \
 
 COPY --from=build /install /usr/local
 
+# The dashboard, served by the same process at "/". Same origin as the API,
+# so the page needs no CORS and no proxy in front of it to work. Named file
+# by file rather than by directory, so the dev proxy and the Pages Function
+# beside them stay out of the image.
+COPY web/index.html web/app.js web/style.css /home/aether/web/
+
 # Nothing here needs to write anything, so it should not be able to.
-RUN useradd --create-home --uid 10001 aether
+RUN useradd --create-home --uid 10001 aether && chown -R aether /home/aether
 USER aether
 WORKDIR /home/aether
 

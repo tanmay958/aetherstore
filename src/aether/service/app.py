@@ -56,6 +56,7 @@ from aether.service.state import ServiceState, state_from_env
 # once the proxy is in place; it is a shared secret, not an identity, and it
 # does not pretend to be one.
 API_KEY_ENV = "AETHER_API_KEY"
+WEB_ROOT_ENV = "AETHER_WEB_ROOT"
 API_KEY_HEADER = "x-aether-key"
 
 MAX_EVENTS_PER_REQUEST = 500
@@ -328,7 +329,44 @@ def create_app(state: ServiceState | None = None) -> FastAPI:
             "at_risk": bool(scored and scored[-1].probability >= body.threshold),
         }
 
+    # The dashboard, served by the same process as the API.
+    #
+    # Same origin, which is the whole reason to do it here: the page calls
+    # /api/* on its own host, so there is no CORS to grant and no proxy to
+    # stand up. Cloudflare Pages in front is still the better end state,
+    # because it puts the static files on an edge that does not cold start and
+    # gives somewhere to rate limit, but that is an addition rather than a
+    # prerequisite, and a service that ships its own front end can be checked
+    # by opening it.
+    #
+    # Mounted last, so every route above wins. A mount at "/" is a catch-all.
+    web = _web_root()
+    if web is not None:
+        from fastapi.staticfiles import StaticFiles
+
+        app.mount("/", StaticFiles(directory=str(web), html=True), name="web")
+
     return app
+
+
+def _web_root() -> "Path | None":
+    """Where the dashboard's files are, if they were shipped.
+
+    Absent in a test and in a source checkout used only for the CLIs, so this
+    returns None rather than failing: the API is the product and the page is a
+    convenience on top of it.
+    """
+    from pathlib import Path
+
+    override = os.environ.get(WEB_ROOT_ENV)
+    candidates = [Path(override)] if override else [
+        Path("/home/aether/web"),                          # the container
+        Path(__file__).resolve().parents[3] / "web",       # a source checkout
+    ]
+    for candidate in candidates:
+        if (candidate / "index.html").is_file():
+            return candidate
+    return None
 
 
 def _why_not(state) -> str:
