@@ -550,6 +550,70 @@ REES46 public clickstream, ~285M events. Attribution, download steps, schema, an
 
 No raw rows from the dataset are committed here; it is not under an open redistribution licence. The test fixture is hand-authored in the REES46 schema.
 
+## Is it live?
+
+Partly, and the honest answer is worth stating because the interesting half is
+the part that is not.
+
+**The hosted index is fed by the real pipeline.** Kafka producer, Kafka
+indexer, segments and manifests on R2, all the actual code. Run the producer
+and the indexer on a laptop pointed at the same bucket the service reads, and
+the hosted document count climbs without a deploy:
+
+```
+23:18:56    40,000 documents   24 segments
+23:19:30    68,000 documents   38 segments
+23:20:04   110,000 documents   59 segments
+23:21:28   140,000 documents   82 segments
+```
+
+Two things had to be true for that, and neither was:
+
+**The service read the manifest once, at start-up.** An instance served
+whatever existed when it booted, forever. A query now refreshes it if it is
+older than `AETHER_REFRESH_SECONDS`, lazily rather than on a timer, because an
+idle instance about to scale to zero should not be polling anything.
+
+**A streamed index could not be searched as a whole.** The batch ingester
+writes one manifest; the streaming indexer writes one *per Kafka partition*,
+because exactly one consumer owns a partition and therefore exactly one
+process writes that manifest. That is where single-writer safety comes from,
+and it is not negotiable. But `Coordinator` read one key, and the Kafka
+integration tests each searched a single partition, so nothing noticed that
+searching a streamed index returned a twelfth of it.
+
+Unioning those manifests has a trap in it. `Manifest.publish` evicts by offset
+range, which is right inside a partition and destroys the index across them:
+offsets are per partition, so all twelve hold a segment covering offset 0 and
+each would evict the others. The union deduplicates by object key instead, and
+`test_partitions_do_not_evict_each_other` asserts both halves.
+
+**What is not live is the continuous part.** Nothing runs in the cloud between
+demos, because a Kafka consumer must be always-on and a free tier scales to
+zero, which for a consumer means falling behind rather than idling cheaply.
+The broker and the predictor replicas run on a laptop. The index they produce
+is hosted; the producing is not.
+
+### Compaction, on a streamed index
+
+82 segments is what 140,000 events through 12 partitions leaves behind, and it
+is the cost compaction exists to remove:
+
+```
+                  segments   requests
+before                  82        169
+after                   46        135
+```
+
+Compaction runs per partition, not across the index, for the same reason the
+manifests are per partition: merging across them would put a second writer on
+a manifest whose safety comes from there being exactly one.
+
+That also changes when it triggers. Twelve partitions fill twelve times more
+slowly, so `--merge-factor 10` found nothing to do at six segments each and
+correctly refused. The policy is right; the factor has to suit the partition,
+not the index.
+
 ## The dashboard
 
 `web/` is a static page and one Cloudflare Pages Function. No framework, no
