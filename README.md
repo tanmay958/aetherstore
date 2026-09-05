@@ -71,8 +71,44 @@ COMPACTION (merge factor 10)
 Cold cost is what a serverless process pays on every invocation, and it is
 driven by how *many* segments there are rather than how big: opening one costs
 two requests before any searching happens. Merging 100 into 10 cuts a cold
-query by **10x**, and answers are identical -- same hits, same document ids,
-same BM25 scores to nine decimal places, verified at a million documents.
+query by **10x in requests**, and answers are identical -- same hits, same
+document ids, same BM25 scores to nine decimal places, verified at a million
+documents.
+
+### What compaction does not fix
+
+Run against real R2, requests fell 124 to 15 and wall time only fell 2,373 ms
+to 2,000 ms. Tracing every read explains why:
+
+```
+ 532 ms  manifest
+ 770 ms  footers        ─┐  the two segments run
+1118 ms  hotcaches       │  in parallel at every
+1337 ms  dict block      │  level, so width is
+1573 ms  dict block      │  already free
+1782 ms  postings        │
+1973 ms  postings       ─┘
+```
+
+**Latency is set by the depth of the dependency chain, not the number of
+requests.** A dictionary block cannot be read until the hotcache is, and the
+hotcache cannot be located until the footer is. Compaction reduces the *width*
+of that fan-out, which was never the bottleneck once there were enough workers.
+
+Bytes moved barely change either. Total hotcache went 5.0 MB to 4.5 MB, because
+compaction consolidates it rather than shrinking it -- per segment it grew from
+50 KB to 450 KB, since the hotcache carries a 32-bit length per document.
+
+So compaction is a **cost** win, not a latency win, and on object storage
+requests are billed. The three things that would cut latency, now measured
+rather than guessed:
+
+- **coalescing** adjacent range reads, which would collapse two dictionary
+  reads and two postings reads into one each: depth 7 to 5
+- **one byte per document length** instead of four, the way Lucene stores
+  norms: hotcache 4.5 MB to about 1.1 MB
+- keeping footers and hotcaches across invocations, which already happens
+  within a process and is why a warm query costs a fraction of a cold one
 
 Phase 1 took postings from 2.29 to 1.35 bytes each and the whole index from
 0.75x of source to 0.66x. The docstore is now 81% of what remains, and is the
