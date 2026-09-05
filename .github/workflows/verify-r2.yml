@@ -1,0 +1,43 @@
+name: verify R2 credentials
+
+# Manual only. GitHub will not let a secret be read back, so the only way to
+# know the repository secrets are correct is to use them. This runs the same
+# storage check the CLI runs, against the real bucket, from a runner.
+#
+# It is also the exact path the indexing job will take in Phase 8: Actions,
+# holding R2 credentials, writing to the bucket. Proving it now means a
+# failure later is about the pipeline rather than about configuration.
+on:
+  workflow_dispatch:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - run: pip install uv
+      - run: uv sync --extra s3
+
+      - name: exercise every operation the segment reader depends on
+        env:
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          BUCKET: ${{ vars.AETHER_R2_BUCKET }}
+        run: uv run python -m aether.storage.check "r2://${BUCKET}"
+
+      - name: search the index already in the bucket
+        env:
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          BUCKET: ${{ vars.AETHER_R2_BUCKET }}
+        # Also the first measurement of R2 latency from inside a datacentre
+        # rather than from a laptop, which is the number a deployed service
+        # would actually see.
+        run: uv run python -m aether.index.search "r2://${BUCKET}/idxc" "samsung smartphone"

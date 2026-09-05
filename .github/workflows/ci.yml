@@ -1,0 +1,28 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      # uv installed with pip rather than a third-party action, so this does
+      # not break when that action's major version moves.
+      - run: pip install uv
+
+      - run: uv sync --all-extras
+
+      # The whole suite runs offline against a committed fixture: no dataset,
+      # no Kaggle account, no network. Integration tests that need MinIO,
+      # Redpanda or R2 skip themselves when those are absent.
+      - run: uv run pytest -q
