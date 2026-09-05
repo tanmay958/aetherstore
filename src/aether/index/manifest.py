@@ -167,6 +167,46 @@ class Manifest:
         )
 
 
+PARTITION_MANIFEST_PREFIX = "manifests/"
+
+
+def partition_manifest_keys(
+    store: ObjectStore, prefix: str = PARTITION_MANIFEST_PREFIX
+) -> list[str]:
+    """Every per-partition manifest under a prefix.
+
+    The streaming indexer writes one manifest per Kafka partition, because
+    single-writer safety is inherited from the log: exactly one consumer owns
+    a partition, so exactly one process writes that manifest and no locking is
+    needed anywhere. A shared manifest would throw that away and need
+    coordination to put it back.
+
+    The read side therefore has to gather them, and it cannot know how many
+    partitions there are without looking. This is the one query-time listing
+    in the engine, and it is one request against a handful of keys.
+    """
+    return sorted(key for key in store.list_keys(prefix) if key.endswith(".json"))
+
+
+def union_manifests(manifests: Iterable[Manifest]) -> Manifest:
+    """One live set spanning several partitions.
+
+    Concatenation, deduplicated by object key, and deliberately **not**
+    `publish`. Publish evicts by offset range, which is right within a
+    partition and catastrophic across them: offsets are per-partition, so
+    partition 0 and partition 1 both hold a segment covering offsets 0 to
+    1999, and each would evict the other. The result would silently serve a
+    twelfth of the index.
+    """
+    seen: dict[str, SegmentMeta] = {}
+    generation = 0
+    for manifest in manifests:
+        generation = max(generation, manifest.generation)
+        for segment in manifest.segments:
+            seen.setdefault(segment.key, segment)
+    return Manifest(tuple(seen.values()), generation, MANIFEST_VERSION)
+
+
 def read_manifest(store: ObjectStore, key: str = DEFAULT_MANIFEST_KEY) -> Manifest:
     """Load the live set. An absent manifest is an empty index, not an error."""
     try:

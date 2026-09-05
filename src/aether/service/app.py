@@ -188,7 +188,9 @@ def create_app(state: ServiceState | None = None) -> FastAPI:
 
     @app.get("/api/index")
     def index_info() -> dict[str, Any]:
-        return current().index_summary()
+        service = current()
+        service.refresh_if_stale()
+        return service.index_summary()
 
     @app.get("/api/model")
     def model_info() -> dict[str, Any]:
@@ -217,6 +219,10 @@ def create_app(state: ServiceState | None = None) -> FastAPI:
         service = current()
         if not service.ready:
             raise HTTPException(503, f"index unavailable: {service.index_error}")
+        # Picks up segments published since this instance started, so a live
+        # indexer writing to the same bucket becomes visible here without a
+        # deploy or a restart.
+        service.refresh_if_stale()
 
         # Counted after analysis, because that is what the engine will
         # actually go and read. Counting the raw string would let punctuation

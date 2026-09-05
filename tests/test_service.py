@@ -485,3 +485,72 @@ def test_a_missing_dashboard_is_not_fatal(monkeypatch, indexed, tmp_path):
     bare = TestClient(create_app(state))
     assert bare.get("/api/search?q=samsung").status_code == 200
     assert bare.get("/").status_code == 404
+
+
+# --------------------------------------------------------------------------
+# picking up data published after the instance started
+# --------------------------------------------------------------------------
+
+
+def test_new_segments_become_visible_without_a_restart(tmp_path, sample_csv):
+    """The property that makes a live indexer worth pointing at this bucket.
+
+    An instance reads the manifest at start-up. If that were the only read, a
+    service would serve a frozen snapshot until it was redeployed, which is
+    exactly what it was doing.
+    """
+    from aether.data.rees46 import iter_events
+
+    store = LocalStore(tmp_path / "growing")
+    events = list(iter_events(sample_csv))
+    ingest(events[:10], store, docs_per_segment=8)
+
+    state = ServiceState(store, model_uri=None, refresh_seconds=0.0001)
+    state.load()
+    client = TestClient(create_app(state))
+    before = client.get("/api/index").json()["documents"]
+
+    # A second indexer run publishes more, as a live one continuously would.
+    ingest(events[10:], store, docs_per_segment=8)
+
+    import time as _time
+
+    _time.sleep(0.01)
+    after = client.get("/api/index").json()["documents"]
+    assert after > before
+
+
+def test_refresh_can_be_switched_off(tmp_path, sample_csv):
+    from aether.data.rees46 import iter_events
+
+    store = LocalStore(tmp_path / "frozen")
+    events = list(iter_events(sample_csv))
+    ingest(events[:10], store, docs_per_segment=8)
+
+    state = ServiceState(store, model_uri=None, refresh_seconds=0)
+    state.load()
+    client = TestClient(create_app(state))
+    before = client.get("/api/index").json()["documents"]
+    ingest(events[10:], store, docs_per_segment=8)
+    assert client.get("/api/index").json()["documents"] == before
+
+
+def test_a_refresh_that_fails_keeps_serving(tmp_path, sample_csv):
+    """A stale manifest is behind, never wrong: every segment it names still
+    exists. Answering a slightly old query beats failing a current one."""
+    from aether.data.rees46 import iter_events
+
+    store = LocalStore(tmp_path / "flaky")
+    ingest(iter_events(sample_csv), store, docs_per_segment=8)
+    state = ServiceState(store, model_uri=None, refresh_seconds=0.0001)
+    state.load()
+    client = TestClient(create_app(state))
+
+    def explode(*_args, **_kwargs):
+        raise ConnectionError("R2 unreachable")
+
+    state.coordinator.refresh = explode
+    import time as _time
+
+    _time.sleep(0.01)
+    assert client.get("/api/search?q=samsung").status_code == 200

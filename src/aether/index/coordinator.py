@@ -67,9 +67,12 @@ from aether.index.analyzer import tokenize
 from aether.index.base import CorpusStats
 from aether.index.manifest import (
     DEFAULT_MANIFEST_KEY,
+    PARTITION_MANIFEST_PREFIX,
     Manifest,
     SegmentMeta,
+    partition_manifest_keys,
     read_manifest,
+    union_manifests,
 )
 from aether.index.scorer import DEFAULT_SCORER, BM25
 from aether.index.segment import SegmentReader
@@ -131,10 +134,18 @@ class Coordinator:
         store: ObjectStore,
         *,
         manifest_key: str = DEFAULT_MANIFEST_KEY,
+        manifest_prefix: str | None = None,
         max_workers: int = 16,
     ) -> None:
         self.store = store
         self.manifest_key = manifest_key
+        # When set, the live set is every per-partition manifest under this
+        # prefix rather than one object. That is what a streamed index looks
+        # like: the indexer writes one manifest per Kafka partition, because
+        # exactly one consumer owns a partition and therefore exactly one
+        # process writes that manifest. Searching the whole index means
+        # reading all of them.
+        self.manifest_prefix = manifest_prefix
         self.max_workers = max_workers
         self._manifest: Manifest | None = None
         self._readers: dict[str, SegmentReader] = {}
@@ -144,8 +155,25 @@ class Coordinator:
     @property
     def manifest(self) -> Manifest:
         if self._manifest is None:
-            self._manifest = read_manifest(self.store, self.manifest_key)
+            self._manifest = self._read_live_set()
         return self._manifest
+
+    def _read_live_set(self) -> Manifest:
+        if self.manifest_prefix is None:
+            return read_manifest(self.store, self.manifest_key)
+
+        keys = partition_manifest_keys(self.store, self.manifest_prefix)
+        if not keys:
+            return Manifest()
+        # Read together, for the same reason segments are searched together:
+        # this is a dozen sequential round trips otherwise, paid on every
+        # cold start.
+        if len(keys) == 1:
+            return read_manifest(self.store, keys[0])
+        with ThreadPoolExecutor(max_workers=min(self.max_workers, len(keys))) as pool:
+            return union_manifests(
+                pool.map(lambda key: read_manifest(self.store, key), keys)
+            )
 
     def refresh(self) -> Manifest:
         """Re-read the manifest, picking up segments written since.
@@ -154,7 +182,7 @@ class Coordinator:
         manifest is byte for byte the same object. Immutability means a
         refresh costs one request and invalidates nothing.
         """
-        self._manifest = read_manifest(self.store, self.manifest_key)
+        self._manifest = self._read_live_set()
         live = {segment.key for segment in self._manifest.segments}
         self._readers = {k: v for k, v in self._readers.items() if k in live}
         return self._manifest

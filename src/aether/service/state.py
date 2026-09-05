@@ -43,7 +43,18 @@ from aether.storage.counting import CountingStore, ReadStats
 
 # Where the index and the model live, overridable so the same image serves a
 # local directory in a test and an R2 bucket in production.
+# How long a manifest may be trusted before it is read again. The index is
+# append-only and published by a single small write, so a stale manifest is
+# never wrong, only behind: it names segments that all still exist and simply
+# omits newer ones. That is what makes polling an adequate answer and a
+# subscription unnecessary.
+REFRESH_SECONDS_ENV = "AETHER_REFRESH_SECONDS"
+DEFAULT_REFRESH_SECONDS = 30.0
+
 INDEX_URI_ENV = "AETHER_INDEX"
+# Set to "manifests/" to serve an index the streaming indexer produced, which
+# has one manifest per Kafka partition rather than one for the whole index.
+MANIFEST_PREFIX_ENV = "AETHER_MANIFEST_PREFIX"
 MODEL_URI_ENV = "AETHER_MODEL"
 DEFAULT_INDEX_URI = "data/idx1m"
 # The numpy format, not the pickle: serving must not import
@@ -71,19 +82,32 @@ class ServiceState:
         store: ObjectStore,
         *,
         manifest_key: str = DEFAULT_MANIFEST_KEY,
+        manifest_prefix: str | None = None,
         model_uri: str | None = DEFAULT_MODEL_URI,
         max_workers: int = 16,
+        refresh_seconds: float = DEFAULT_REFRESH_SECONDS,
     ) -> None:
         # Counting wraps the store rather than the coordinator so that every
         # read is seen, including the ones the model load makes.
         self.store = CountingStore(store)
         self.manifest_key = manifest_key
         self.model_uri = model_uri
+        self.manifest_prefix = manifest_prefix
         self.coordinator = Coordinator(
-            self.store, manifest_key=manifest_key, max_workers=max_workers
+            self.store,
+            manifest_key=manifest_key,
+            manifest_prefix=manifest_prefix,
+            max_workers=max_workers,
         )
         self._measuring = threading.Lock()
         self.started_at = time.time()
+
+        # Checked lazily, on a query, rather than by a background timer. An
+        # idle instance should cost nothing, and one that is about to scale to
+        # zero has no reason to keep polling object storage on the way out.
+        self.refresh_seconds = refresh_seconds
+        self._refreshed_at = 0.0
+        self._refreshing = threading.Lock()
 
         self.model = None
         self.model_error: str | None = None
@@ -114,8 +138,41 @@ class ServiceState:
     def _load_index(self) -> None:
         try:
             self.coordinator.refresh()
+            self._refreshed_at = time.monotonic()
         except Exception as error:  # noqa: BLE001 - reported, not swallowed
             self.index_error = f"{type(error).__name__}: {error}"
+
+    def refresh_if_stale(self) -> bool:
+        """Re-read the manifest if it has been trusted long enough.
+
+        Costs one request, and only ever when a query arrives after the
+        interval has passed. Segment readers survive it: a segment named in
+        both the old manifest and the new one is byte for byte the same
+        object, so immutability means a refresh invalidates nothing.
+
+        A failure here is deliberately swallowed. The manifest already in hand
+        is still valid, every segment it names still exists, and answering a
+        slightly old query beats failing a current one.
+        """
+        if self.refresh_seconds <= 0 or self.index_error:
+            return False
+        if time.monotonic() - self._refreshed_at < self.refresh_seconds:
+            return False
+        # Whoever gets the lock does the read; everyone else uses what is
+        # there rather than queueing behind a network round trip.
+        if not self._refreshing.acquire(blocking=False):
+            return False
+        try:
+            if time.monotonic() - self._refreshed_at < self.refresh_seconds:
+                return False
+            self.coordinator.refresh()
+            self._refreshed_at = time.monotonic()
+            return True
+        except Exception:  # noqa: BLE001
+            self._refreshed_at = time.monotonic()
+            return False
+        finally:
+            self._refreshing.release()
 
     def _load_model(self) -> None:
         if not self.model_uri:
@@ -177,7 +234,11 @@ class ServiceState:
             "documents": manifest.docs,
             "segments": len(manifest.segments),
             "bytes": manifest.bytes,
-            "manifest_key": self.manifest_key,
+            "source": (
+                f"{self.manifest_prefix}* (one per Kafka partition)"
+                if self.manifest_prefix
+                else self.manifest_key
+            ),
         }
 
     def model_summary(self) -> dict:
@@ -203,6 +264,13 @@ def state_from_env() -> ServiceState:
     load_dotenv()
     uri = os.environ.get(INDEX_URI_ENV, DEFAULT_INDEX_URI)
     model_uri = os.environ.get(MODEL_URI_ENV, DEFAULT_MODEL_URI)
-    state = ServiceState(open_store(uri), model_uri=model_uri or None)
+    state = ServiceState(
+        open_store(uri),
+        manifest_prefix=os.environ.get(MANIFEST_PREFIX_ENV) or None,
+        model_uri=model_uri or None,
+        refresh_seconds=float(
+            os.environ.get(REFRESH_SECONDS_ENV, DEFAULT_REFRESH_SECONDS)
+        ),
+    )
     state.load()
     return state
