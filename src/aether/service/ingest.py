@@ -24,6 +24,24 @@ building coordination this project has spent its whole life avoiding.
 Within the instance, a lock serialises concurrent requests. That is not
 coordination between machines; it is one process not racing itself.
 
+## Where that guarantee stops
+
+`--max-instances=1` is per revision, not across them. During a rollout Cloud
+Run drains the old revision while the new one starts, so for a few seconds two
+processes can both believe they own this partition, and both compute their
+next offset from the same manifest.
+
+The outcome is not corruption, and that is by design rather than by luck.
+`Manifest.publish` evicts by offset range, so when the second writer publishes
+a wider range covering what the first already wrote, the narrower entries are
+superseded rather than duplicated: the documents survive, and the superseded
+objects become orphans for the collector. Observed live during a deploy, as
+the segment count falling from 120 to 117 while the document count kept
+climbing, which is exactly the shape that eviction is meant to produce.
+
+What would remove even that is a compare-and-swap on the manifest, which R2
+supports through a conditional PUT and `ObjectStore` does not yet expose.
+
 ## A dedicated partition
 
 Hosted ingest writes to a partition number outside the range any Kafka
